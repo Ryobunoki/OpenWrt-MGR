@@ -1,0 +1,56 @@
+# Built artifacts
+/.gradle/
+/.kotlin/
+/build/
+/app/build/
+/local.properties
+*.apk
+*.ap_
+*.aab
+*.dex
+*.class
+*.idsig
+
+# IDE
+/.idea/
+*.iml
+/.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs / crash dumps
+*.log
+hs_err_pid*
+replay_pid*
+build_out.txt
+build_err.txt
+build-log.txt
+build-err.txt
+compile_out.txt
+crash_*.txt
+stop_out.txt
+
+# Local tooling / temp scratch (not part of the app)
+/_*/
+_*.py
+_*.txt
+_*.zip
+_*.apk*
+*.tmp
+
+# Font / nerd-font extract caches
+/_font_extract/
+/_nerd_fonts/
+/_nf/
+/_dex_chk/
+/_jsch_cls/
+/.tools/
+
+# Optional local archives
+ubuntu-font.zip
+_jbmono.zip
+i18n.tsv
+
+# Captures
+captures/

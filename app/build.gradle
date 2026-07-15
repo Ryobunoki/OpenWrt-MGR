@@ -1,0 +1,134 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
+android {
+    namespace 'com.openwrt.mgr'
+    compileSdk 36
+    buildToolsVersion "36.1.0"
+    defaultConfig {
+        applicationId "com.openwrt.mgr"
+        minSdk 26
+        targetSdk 36
+        versionCode 28
+        versionName "1.6.6"
+        ndk { abiFilters 'arm64-v8a' }
+    }
+    signingConfigs {
+        release {
+            storeFile file(System.properties['user.home'] + "/.android/debug.keystore")
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }
+    buildTypes {
+        debug { minifyEnabled false; shrinkResources false; debuggable true }
+        release {
+            minifyEnabled true
+            shrinkResources true
+            signingConfig signingConfigs.release
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            vcsInfo.include false
+        }
+    }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+    kotlinOptions { jvmTarget = '17' }
+    buildFeatures { compose true; buildConfig true }
+    dependenciesInfo { includeInApk false; includeInBundle false }
+    packaging {
+        jniLibs {
+            useLegacyPackaging true
+            excludes += ['**/x86/**','**/x86_64/**','**/armeabi/**','**/armeabi-v7a/**']
+        }
+        resources {
+            excludes += [
+                '/META-INF/{AL2.0,LGPL2.1}','META-INF/**','okhttp3/**','DebugProbesKt.bin',
+                'kotlin-tooling-metadata.json','**/*.kotlin_builtins','**/*.kotlin_module',
+                '**/*.properties','**/baseline.prof','**/baseline.profm','assets/dexopt/**',
+                '**.version','kotlin/**','google/**','META-INF/services/**'
+            ]
+        }
+    }
+    splits { abi { enable false } }
+    lint { checkReleaseBuilds false; abortOnError false }
+}
+configurations { jschRaw }
+tasks.register('slimJsch', Jar) {
+    dependsOn configurations.jschRaw
+    archiveFileName = 'jsch-slim.jar'
+    destinationDirectory = layout.buildDirectory.dir('slim-jsch')
+    from({
+        zipTree(configurations.jschRaw.singleFile).matching {
+            exclude '**/ChannelSftp*.class'
+            exclude '**/Sftp*.class'
+            exclude '**/ChannelX11*.class'
+            exclude '**/ChannelAgent*.class'
+            exclude '**/ChannelForwarded*.class'
+            exclude '**/ChannelDirect*.class'
+            exclude '**/ChannelSubsystem*.class'
+            exclude '**/ChannelExec*.class'
+            exclude '**/Proxy*.class'
+            exclude '**/Agent*.class'
+            exclude '**/Pageant*.class'
+            exclude '**/SSHAgent*.class'
+            exclude '**/JUnixSocket*.class'
+            exclude '**/UnixDomain*.class'
+            exclude '**/USocket*.class'
+            exclude '**/OpenSSHConfig*.class'
+            exclude '**/UserAuthPublicKey*.class'
+            exclude '**/UserAuthGSSAPI*.class'
+            exclude '**/jgss/**'
+            exclude '**/bc/**'
+            exclude '**/jzlib/**'
+            exclude '**/jbcrypt/**'
+            exclude '**/Log4j2Logger*.class'
+            exclude '**/Slf4jLogger*.class'
+            exclude '**/JplLogger*.class'
+            exclude '**/PortWatcher*.class'
+            exclude '**/ForwardedTCPIPDaemon*.class'
+            exclude '**/RequestSftp*.class'
+            exclude '**/RequestX11*.class'
+            exclude '**/RequestAgent*.class'
+            exclude '**/RequestSubsystem*.class'
+            exclude '**/RequestExec*.class'
+            exclude '**/KeyPairGen*.class'
+            exclude '**/IdentityFile*.class'
+            exclude '**/LocalIdentityRepository*.class'
+            exclude '**/IdentityRepositoryWrapper*.class'
+            exclude '**/Argon2*.class'
+            exclude '**/BCrypt*.class'
+            exclude '**/SCrypt*.class'
+            exclude '**/Compression*.class'
+            exclude '**/jce/ARCFOUR*.class'
+            exclude '**/jce/Blowfish*.class'
+            exclude '**/jce/TripleDES*.class'
+            exclude '**/jce/AES*GCM*.class'
+            exclude '**/DHG15*.class'
+            exclude '**/DHG16*.class'
+            exclude '**/DHG17*.class'
+            exclude '**/DHG18*.class'
+            exclude '**/DH25519SNTRUP*.class'
+            exclude '**/DH448*.class'
+            exclude '**/DHXECKEM*.class'
+        }
+    })
+}
+tasks.named('preBuild').configure { dependsOn('slimJsch') }
+tasks.withType(JavaCompile).configureEach { dependsOn('slimJsch') }
+tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach { dependsOn('slimJsch') }
+dependencies {
+    def composeBom = platform('androidx.compose:compose-bom:2024.12.01')
+    implementation composeBom
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.material3:material3'
+    implementation 'androidx.compose.material:material-icons-extended'
+    implementation 'androidx.activity:activity-compose:1.9.3'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.8.7'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.7'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0'
+    jschRaw 'com.github.mwiede:jsch:0.2.21'
+    implementation files(layout.buildDirectory.file('slim-jsch/jsch-slim.jar'))
+}
+

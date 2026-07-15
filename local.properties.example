@@ -1,0 +1,4 @@
+## Copy this file to local.properties and set your SDK path.
+## Do not commit local.properties.
+
+sdk.dir=C:/Users/YOUR_NAME/AppData/Local/Android/Sdk

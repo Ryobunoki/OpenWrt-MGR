@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#FF8FB5</color>
+    <color name="ic_launcher_bg_sakura">#FF8FB5</color>
+    <color name="ic_launcher_bg_mint">#6CDBAB</color>
+    <color name="ic_launcher_bg_ocean">#4AA8D8</color>
+    <color name="ic_launcher_bg_minimal">#F2F2F2</color>
+    <color name="ic_launcher_bg_custom">#B12D5B</color>
+    <color name="primary">#B12D5B</color>
+    <color name="on_primary">#FFFFFF</color>
+    <color name="primary_container">#FFD9E2</color>
+    <color name="background">#FFF8F8</color>
+</resources>
