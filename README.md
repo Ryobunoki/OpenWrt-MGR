@@ -1,3 +1,5 @@
+# ~~用Codex瞎几把写的（）~~
+
 # OpenWrt-MGR
 
 轻量 Android OpenWrt 管理客户端（Jetpack Compose + Material You）。
