@@ -245,9 +245,9 @@ object AnsiStrip {
                 val chunk = text.substring(i, next)
                 if (chunk.isNotEmpty()) {
                     val fg = when {
-                        state.fg != null && state.dim -> state.fg!!.copy(alpha = 0.65f)
+                        state.fg != null && state.dim -> state.fg!!.copy(alpha = 0.78f)
                         state.fg != null -> state.fg!!
-                        state.dim -> defaultColor.copy(alpha = 0.65f)
+                        state.dim -> defaultColor.copy(alpha = 0.78f)
                         else -> defaultColor
                     }
                     withStyle(
@@ -301,22 +301,22 @@ object AnsiStrip {
                 }
                 23 -> state.italic = false
                 24 -> state.underline = false
-                in 30..37 -> state.fg = basic[code - 30]
+                in 30..37 -> state.fg = if (state.bold) bright[code - 30] else basic[code - 30]
                 38 -> {
                     val (color, consumed) = extendedColor(parts, idx + 1)
                     if (color != null) state.fg = color
                     idx += consumed
                 }
                 39 -> state.fg = null
-                in 40..47 -> state.bg = basic[code - 40].copy(alpha = 0.40f)
+                in 40..47 -> state.bg = basic[code - 40]
                 48 -> {
                     val (color, consumed) = extendedColor(parts, idx + 1)
-                    if (color != null) state.bg = color.copy(alpha = 0.40f)
+                    if (color != null) state.bg = color
                     idx += consumed
                 }
                 49 -> state.bg = null
                 in 90..97 -> state.fg = bright[code - 90]
-                in 100..107 -> state.bg = bright[code - 100].copy(alpha = 0.40f)
+                in 100..107 -> state.bg = bright[code - 100]
             }
             idx++
         }
