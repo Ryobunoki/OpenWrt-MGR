@@ -5,7 +5,7 @@
 轻量 Android OpenWrt 管理客户端（Jetpack Compose + Material You）。
 
 Author: **by Ryobunoki using Codex**  
-Version: **1.6.6** · Package: `com.openwrt.mgr`
+Package: `com.openwrt.mgr`
 
 ## 功能
 
