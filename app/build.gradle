@@ -11,8 +11,8 @@ android {
         applicationId "com.openwrt.mgr"
         minSdk 26
         targetSdk 36
-        versionCode 39
-        versionName "1.6.17"
+        versionCode 41
+        versionName "1.6.19"
         ndk { abiFilters 'arm64-v8a' }
     }
     signingConfigs {
@@ -68,7 +68,6 @@ tasks.register('slimJsch', Jar) {
             exclude '**/ChannelForwarded*.class'
             exclude '**/ChannelDirect*.class'
             exclude '**/ChannelSubsystem*.class'
-            exclude '**/ChannelExec*.class'
             exclude '**/Proxy*.class'
             exclude '**/Agent*.class'
             exclude '**/Pageant*.class'
@@ -92,7 +91,6 @@ tasks.register('slimJsch', Jar) {
             exclude '**/RequestX11*.class'
             exclude '**/RequestAgent*.class'
             exclude '**/RequestSubsystem*.class'
-            exclude '**/RequestExec*.class'
             exclude '**/KeyPairGen*.class'
             exclude '**/IdentityFile*.class'
             exclude '**/LocalIdentityRepository*.class'

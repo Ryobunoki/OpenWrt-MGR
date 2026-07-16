@@ -439,35 +439,71 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+
+    private fun privilegedSession(): com.openwrt.mgr.data.RouterSession? {
+        val s = state.session ?: return null
+        // Re-attach login password/SSH port so file.exec ACL-denied ops can fall back to SSH.
+        return s.withCredentials(state.password, state.sshPort)
+    }
+
+    private fun localizeActionMessage(raw: String?): String {
+        val msg = raw.orEmpty()
+        val L = l10n()
+        return when {
+            msg.startsWith("OK_PLUGIN_ENABLED:") -> L.t("plugin_enabled", msg.removePrefix("OK_PLUGIN_ENABLED:"))
+            msg.startsWith("OK_PLUGIN_DISABLED:") -> L.t("plugin_disabled", msg.removePrefix("OK_PLUGIN_DISABLED:"))
+            msg.startsWith("OK_PLUGIN_RESTARTED:") -> L.t("plugin_restarted", msg.removePrefix("OK_PLUGIN_RESTARTED:"))
+            msg.startsWith("OK_KILL_SENT:") -> {
+                val parts = msg.removePrefix("OK_KILL_SENT:").split(":")
+                L.t("kill_sent", parts.getOrNull(0).orEmpty(), parts.getOrNull(1) ?: "TERM")
+            }
+            msg == "ERR_PLUGIN_NO_INIT" -> L.t("plugin_no_init")
+            msg == "ERR_FILE_EXEC_ACL" || msg == "ERR_FILE_EXEC_NEED_SSH" || msg == "ERR_EXEC_FAILED" ->
+                L.t("plugin_exec_denied")
+            msg.startsWith("ERR_SSH_FALLBACK:") ->
+                L.t("plugin_ssh_fallback_failed", msg.removePrefix("ERR_SSH_FALLBACK:"))
+            msg.startsWith("ERR_PLUGIN_CONTROL:") ->
+                L.t("plugin_control_failed", msg.removePrefix("ERR_PLUGIN_CONTROL:"))
+            msg == "ERR_KILL_INVALID_PID" -> L.t("kill_invalid_pid")
+            msg == "ERR_KILL_PID1" -> L.t("kill_pid1")
+            msg == "SSH_NOT_CONNECTED" -> L.sshNotConnected
+            msg.contains("code=6") || msg.contains("file.exec", ignoreCase = true) -> L.t("plugin_exec_denied")
+            msg == "SSH 已断开" -> L.sshDisconnected
+            else -> msg.ifBlank { L.operationFailed }
+        }
+    }
+
     fun togglePlugin(plugin: PluginInfo, enable: Boolean) {
-        val session = state.session ?: return
+        val session = privilegedSession() ?: return
         viewModelScope.launch {
             state = state.copy(isLoading = true, errorMessage = null, statusMessage = null)
             val result = withContext(Dispatchers.IO) {
                 runCatching { client.setPluginEnabled(session, plugin, enable) }
-                    .getOrElse { com.openwrt.mgr.data.RouterActionResult(false, it.message ?: l10n().operationFailed) }
+                    .getOrElse { com.openwrt.mgr.data.RouterActionResult(false, it.message ?: "ERR_PLUGIN_CONTROL") }
             }
+            val msg = localizeActionMessage(result.message)
             if (result.success) {
                 refreshPlugins()
-                state = state.copy(statusMessage = result.message)
+                state = state.copy(statusMessage = msg)
             } else {
-                state = state.copy(isLoading = false, errorMessage = result.message)
+                state = state.copy(isLoading = false, errorMessage = msg)
             }
         }
     }
 
     fun restartPlugin(plugin: PluginInfo) {
-        val session = state.session ?: return
+        val session = privilegedSession() ?: return
         viewModelScope.launch {
             state = state.copy(isLoading = true, errorMessage = null, statusMessage = null)
             val result = withContext(Dispatchers.IO) {
                 runCatching { client.restartPlugin(session, plugin) }
-                    .getOrElse { com.openwrt.mgr.data.RouterActionResult(false, it.message ?: l10n().rebootFailed) }
+                    .getOrElse { com.openwrt.mgr.data.RouterActionResult(false, it.message ?: "ERR_PLUGIN_CONTROL") }
             }
+            val msg = localizeActionMessage(result.message)
             state = if (result.success) {
-                state.copy(isLoading = false, statusMessage = result.message)
+                state.copy(isLoading = false, statusMessage = msg)
             } else {
-                state.copy(isLoading = false, errorMessage = result.message)
+                state.copy(isLoading = false, errorMessage = msg)
             }
         }
     }
@@ -528,11 +564,16 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
                 },
                 onStatus = { connected, msg ->
                     mainHandler.post {
+                        val statusText = when {
+                            connected -> l10n().sshConnected
+                            msg.isNullOrBlank() -> l10n().sshDisconnected
+                            else -> localizeActionMessage(msg)
+                        }
                         state = state.copy(
                             sshConnected = connected,
                             sshConnecting = false,
-                            sshStatus = msg,
-                            statusMessage = if (connected) l10n().sshConnected else msg
+                            sshStatus = statusText,
+                            statusMessage = statusText
                         )
                     }
                 }
@@ -656,7 +697,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun killProcess(pid: String) {
-        val session = state.session ?: return
+        val session = privilegedSession() ?: return
         viewModelScope.launch {
             state = state.copy(isLoading = true, errorMessage = null, statusMessage = null)
             val result = withContext(Dispatchers.IO) {
@@ -664,14 +705,14 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
                     .getOrElse { com.openwrt.mgr.data.RouterActionResult(false, it.message ?: l10n().t("kill_failed")) }
             }
             if (result.success) {
-                state = state.copy(isLoading = false, statusMessage = result.message)
+                state = state.copy(isLoading = false, statusMessage = localizeActionMessage(result.message))
                 // refresh list after kill
                 runCatching {
                     val list = withContext(Dispatchers.IO) { client.listProcesses(session) }
                     state = state.copy(processes = list, processesError = null)
                 }
             } else {
-                state = state.copy(isLoading = false, errorMessage = result.message)
+                state = state.copy(isLoading = false, errorMessage = localizeActionMessage(result.message))
             }
         }
     }
@@ -770,7 +811,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun generateBackup() {
-        val session = state.session ?: return
+        val session = privilegedSession() ?: return
         viewModelScope.launch {
             state = state.copy(isLoading = true, errorMessage = null, statusMessage = null)
             val result = withContext(Dispatchers.IO) {
@@ -780,13 +821,13 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
             state = if (result.success && result.bytes != null) {
                 state.copy(
                     isLoading = false,
-                    statusMessage = result.message,
+                    statusMessage = localizeActionMessage(result.message),
                     pendingDownloadBytes = result.bytes,
                     pendingDownloadName = result.fileName.ifBlank { "openwrt-backup.tar.gz" },
                     pendingDownloadNonce = System.currentTimeMillis()
                 )
             } else {
-                state.copy(isLoading = false, errorMessage = result.message)
+                state.copy(isLoading = false, errorMessage = localizeActionMessage(result.message))
             }
         }
     }
@@ -794,7 +835,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
     fun factoryReset() = runAction { client.factoryReset(it) }
 
     fun restoreBackup(bytes: ByteArray) {
-        val session = state.session ?: return
+        val session = privilegedSession() ?: return
         viewModelScope.launch {
             state = state.copy(isLoading = true, errorMessage = null, statusMessage = null)
             val result = withContext(Dispatchers.IO) {
@@ -836,7 +877,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun flashFirmware(bytes: ByteArray) {
-        val session = state.session ?: return
+        val session = privilegedSession() ?: return
         val keep = state.keepSettingsOnFlash
         viewModelScope.launch {
             state = state.copy(isLoading = true, errorMessage = null, statusMessage = null)
@@ -858,7 +899,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
 
 
     private fun runAction(block: (RouterSession) -> com.openwrt.mgr.data.RouterActionResult) {
-        val session = state.session ?: return
+        val session = privilegedSession() ?: return
         viewModelScope.launch {
             state = state.copy(isLoading = true, errorMessage = null, statusMessage = null)
             val result = withContext(Dispatchers.IO) {
@@ -867,10 +908,11 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
                         com.openwrt.mgr.data.RouterActionResult(false, it.message ?: l10n().operationFailed)
                     }
             }
+            val msg = localizeActionMessage(result.message)
             state = if (result.success) {
-                state.copy(isLoading = false, statusMessage = result.message)
+                state.copy(isLoading = false, statusMessage = msg)
             } else {
-                state.copy(isLoading = false, errorMessage = result.message)
+                state.copy(isLoading = false, errorMessage = msg)
             }
         }
     }

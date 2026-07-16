@@ -1,5 +1,6 @@
 package com.openwrt.mgr.data
 
+import com.jcraft.jsch.ChannelExec
 import com.jcraft.jsch.ChannelShell
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
@@ -102,7 +103,7 @@ class SshClient {
                     // closed or IO error
                 } finally {
                     if (connected.getAndSet(false)) {
-                        statusListener?.invoke(false, "SSH 已断开")
+                        statusListener?.invoke(false, null)
                     }
                     runCatching { ch.disconnect() }
                     runCatching { sess.disconnect() }
@@ -114,13 +115,13 @@ class SshClient {
         } catch (e: Exception) {
             connected.set(false)
             disconnectQuiet()
-            statusListener?.invoke(false, e.message ?: "SSH 连接失败")
+            statusListener?.invoke(false, e.message)
             throw e
         }
     }
 
     fun send(text: String) {
-        val stream = stdin ?: throw IllegalStateException("SSH 未连接")
+        val stream = stdin ?: throw IllegalStateException("SSH_NOT_CONNECTED")
         synchronized(stream) {
             stream.write(text.toByteArray(Charsets.UTF_8))
             stream.flush()
@@ -211,12 +212,12 @@ class SshClient {
             if (err !is Exception && err !is Error) return@let
         }
     }
-companion object {
+    companion object {
         /**
-         * One-shot non-interactive SSH command (ChannelExec).
+         * One-shot non-interactive SSH command via ChannelExec.
          * Used when ubus file.exec is ACL-denied (code=6).
-         * @return exitStatus to stdout text (UTF-8, lossy for binary)
          */
+        @JvmStatic
         fun execOnce(
             host: String,
             port: Int,
@@ -247,26 +248,29 @@ companion object {
             sess.timeout = timeoutMs.coerceIn(5_000, 600_000)
             try {
                 sess.connect(15_000)
-                val ch = sess.openChannel("exec") as com.jcraft.jsch.ChannelExec
+                val ch = sess.openChannel("exec") as ChannelExec
                 ch.setCommand(command)
                 ch.setInputStream(null)
                 val stdout = ch.inputStream
-                val stderr = ch.errStream
+                val stderr = ch.extInputStream
                 ch.connect(10_000)
                 val out = java.io.ByteArrayOutputStream()
                 val err = java.io.ByteArrayOutputStream()
                 val buf = ByteArray(8192)
-                val deadline = System.currentTimeMillis() + timeoutMs
+                val deadline = System.currentTimeMillis() + timeoutMs.toLong()
                 while (true) {
+                    var readSomething = false
                     while (stdout.available() > 0) {
                         val n = stdout.read(buf)
                         if (n <= 0) break
                         out.write(buf, 0, n)
+                        readSomething = true
                     }
                     while (stderr.available() > 0) {
                         val n = stderr.read(buf)
                         if (n <= 0) break
                         err.write(buf, 0, n)
+                        readSomething = true
                     }
                     if (ch.isClosed) {
                         while (stdout.available() > 0) {
@@ -283,9 +287,9 @@ companion object {
                     }
                     if (System.currentTimeMillis() > deadline) {
                         ch.disconnect()
-                        throw RuntimeException("SSH 命令超时: $command")
+                        throw RuntimeException("SSH timeout")
                     }
-                    Thread.sleep(40)
+                    if (!readSomething) Thread.sleep(40)
                 }
                 val code = ch.exitStatus
                 ch.disconnect()

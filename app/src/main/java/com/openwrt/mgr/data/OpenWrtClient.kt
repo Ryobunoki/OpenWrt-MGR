@@ -1325,42 +1325,69 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
 
     fun setPluginEnabled(session: RouterSession, plugin: PluginInfo, enable: Boolean): RouterActionResult {
         val init = plugin.initScript
-            ?: return RouterActionResult(false, "未找到可控制的服务脚本")
+            ?: return RouterActionResult(false, "ERR_PLUGIN_NO_INIT")
         return try {
             if (enable) {
-                execCommand(session, "/etc/init.d/$init", listOf("enable"))
-                execCommand(session, "/etc/init.d/$init", listOf("start"))
-                RouterActionResult(true, "${plugin.name} 已启用并启动")
+                runInitAction(session, init, "enable")
+                runInitAction(session, init, "start")
+                RouterActionResult(true, "OK_PLUGIN_ENABLED:${plugin.name}")
             } else {
-                execCommand(session, "/etc/init.d/$init", listOf("stop"))
-                execCommand(session, "/etc/init.d/$init", listOf("disable"))
-                RouterActionResult(true, "${plugin.name} 已停止并禁用")
+                runInitAction(session, init, "stop")
+                runInitAction(session, init, "disable")
+                RouterActionResult(true, "OK_PLUGIN_DISABLED:${plugin.name}")
             }
         } catch (e: Exception) {
-            val msg = e.message ?: "插件操作失败"
-            RouterActionResult(
-                false,
-                if (msg.contains("code=6")) {
-                    "路由器禁止 file.exec（ACL code=6），无法启停服务。可检测插件，但控制服务需要放行 ubus file.exec。"
-                } else msg
-            )
+            RouterActionResult(false, mapPluginError(e))
         }
     }
 
     fun restartPlugin(session: RouterSession, plugin: PluginInfo): RouterActionResult {
         val init = plugin.initScript
-            ?: return RouterActionResult(false, "未找到可控制的服务脚本")
+            ?: return RouterActionResult(false, "ERR_PLUGIN_NO_INIT")
         return try {
-            execCommand(session, "/etc/init.d/$init", listOf("restart"))
-            RouterActionResult(true, "${plugin.name} 已重启")
+            try {
+                runInitAction(session, init, "restart")
+            } catch (_: Exception) {
+                // Some init scripts lack restart; stop+start is equivalent.
+                runInitAction(session, init, "stop")
+                runInitAction(session, init, "start")
+            }
+            RouterActionResult(true, "OK_PLUGIN_RESTARTED:${plugin.name}")
         } catch (e: Exception) {
-            val msg = e.message ?: "重启失败"
-            RouterActionResult(
-                false,
-                if (msg.contains("code=6")) {
-                    "路由器禁止 file.exec（ACL code=6），无法重启服务。"
-                } else msg
-            )
+            RouterActionResult(false, mapPluginError(e))
+        }
+    }
+
+    /** Safe init.d control: ubus file.exec first, then SSH fallback via execCommand. */
+    private fun runInitAction(session: RouterSession, init: String, action: String) {
+        val safe = init.filter { it.isLetterOrDigit() || it == '-' || it == '_' || it == '.' }
+        if (safe.isEmpty() || safe != init) {
+            throw OpenWrtException("ERR_PLUGIN_NO_INIT")
+        }
+        val act = action.lowercase()
+        if (act !in setOf("enable", "disable", "start", "stop", "restart", "reload")) {
+            throw OpenWrtException("ERR_PLUGIN_NO_INIT")
+        }
+        try {
+            execCommand(session, "/etc/init.d/$safe", listOf(act))
+        } catch (first: Exception) {
+            // One-shot shell is more reliable on some SSH/busybox builds.
+            execCommand(session, "/bin/sh", listOf("-c", "/etc/init.d/$safe $act"))
+        }
+    }
+
+    private fun mapPluginError(e: Exception): String {
+        val msg = e.message.orEmpty()
+        return when {
+            msg.startsWith("ERR_") || msg.startsWith("OK_") -> msg
+            msg.contains("code=6") || msg.contains("file.exec", ignoreCase = true) -> {
+                if (msg.contains("SSH", ignoreCase = true) || msg.contains("ssh")) {
+                    "ERR_SSH_FALLBACK:${msg.substringAfterLast(':').ifBlank { msg }}"
+                } else {
+                    "ERR_FILE_EXEC_ACL"
+                }
+            }
+            else -> "ERR_PLUGIN_CONTROL:${msg.ifBlank { "unknown" }}"
         }
     }
 
@@ -1451,10 +1478,10 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
     fun killProcess(session: RouterSession, pid: String, force: Boolean = false): RouterActionResult {
         val p = pid.trim()
         if (p.isEmpty() || !p.all(Char::isDigit)) {
-            return RouterActionResult(false, "无效 PID")
+            return RouterActionResult(false, "ERR_KILL_INVALID_PID")
         }
         if (p == "1") {
-            return RouterActionResult(false, "不能结束 PID 1 (procd/init)")
+            return RouterActionResult(false, "ERR_KILL_PID1")
         }
         val signal = if (force) "9" else "15"
         return try {
@@ -1465,9 +1492,9 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
             }.recoverCatching {
                 execCommand(session, "kill", listOf("-$signal", p))
             }.getOrThrow()
-            RouterActionResult(true, "已向 PID $p 发送 SIG${if (force) "KILL" else "TERM"}")
+            RouterActionResult(true, "OK_KILL_SENT:$p:${if (force) "KILL" else "TERM"}")
         } catch (e: Exception) {
-            RouterActionResult(false, e.message ?: "结束进程失败。若提示 code=6，将尝试用登录密码经 SSH 执行。")
+            RouterActionResult(false, mapPluginError(e))
         }
     }
 
@@ -1975,22 +2002,18 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         }
 
         // Many OpenWrt builds deny file.exec (ubus code=6). Fall back to one-shot SSH.
-        if (session.hasExecFallback) {
+        val canSsh = session.hasExecFallback || session.password.isNotBlank()
+        if (canSsh) {
             try {
                 return execViaSsh(session, command, params)
             } catch (sshEx: Exception) {
-                throw OpenWrtException(
-                    buildString {
-                        append(friendlyExecError(ubusErr))
-                        append("；SSH 回退也失败：")
-                        append(sshEx.message ?: "unknown")
-                    }
-                )
+                val detail = sshEx.message?.take(180)?.ifBlank { null } ?: "unknown"
+                throw OpenWrtException("ERR_SSH_FALLBACK:$detail")
             }
         }
         throw OpenWrtException(
-            friendlyExecError(ubusErr) +
-                "。应用会用登录密码自动经 SSH 执行（kill/备份/刷机等），请确认密码正确且 SSH 端口可用（设置里可改）。也可在路由放行 ubus file.exec。"
+            if (friendlyExecError(ubusErr) == "ERR_FILE_EXEC_ACL") "ERR_FILE_EXEC_NEED_SSH"
+            else friendlyExecError(ubusErr)
         )
     }
 
@@ -2011,7 +2034,7 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         val stderr = data.optString("stderr", "")
         val code = data.optInt("code", 0)
         if (code == 6 && stdout.isBlank() && stderr.isBlank()) {
-            throw OpenWrtException("ubus 调用失败 (file.exec code=6)")
+            throw OpenWrtException("ERR_FILE_EXEC_ACL")
         }
         return buildString {
             append(stdout)
@@ -2034,7 +2057,7 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
             command = cmd
         )
         if (code != 0 && out.isBlank()) {
-            throw OpenWrtException("SSH 命令失败 code=$code: $cmd")
+            throw OpenWrtException("ERR_SSH_FALLBACK:code=$code")
         }
         return out
     }
@@ -2057,9 +2080,10 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
     private fun friendlyExecError(e: Exception?): String {
         val msg = e?.message.orEmpty()
         return when {
-            msg.contains("code=6") -> "路由器 ACL 禁止 ubus file.exec（code=6）"
+            msg.startsWith("ERR_") -> msg
+            msg.contains("code=6") -> "ERR_FILE_EXEC_ACL"
             msg.isNotBlank() -> msg
-            else -> "无法执行命令"
+            else -> "ERR_EXEC_FAILED"
         }
     }
 
@@ -2508,10 +2532,7 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         )
     }
 
-    private fun shellQuote(s: String): String =
-        "'" + s.replace("'", "'\\''") + "'"
-
-    private fun fetchStorageLuci(session: RouterSession): List<StorageVolume> {
+        private fun fetchStorageLuci(session: RouterSession): List<StorageVolume> {
         val out = mutableListOf<StorageVolume>()
         fun absorbObj(o: org.json.JSONObject) {
             val mount = o.optString("mount", o.optString("path", o.optString("target", ""))).ifBlank { return }
