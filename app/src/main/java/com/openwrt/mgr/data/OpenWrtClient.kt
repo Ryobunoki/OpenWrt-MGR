@@ -1,5 +1,8 @@
 package com.openwrt.mgr.data
 
+import android.util.Base64
+import java.io.ByteArrayOutputStream
+
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.cert.CertificateException
@@ -118,10 +121,26 @@ data class RouterActionResult(
     val message: String
 )
 
+data class MtdPartition(
+    val index: Int,
+    val dev: String,
+    val name: String,
+    val size: Long,
+    val erasesize: Long
+)
+
+data class BinaryActionResult(
+    val success: Boolean,
+    val message: String,
+    val bytes: ByteArray? = null,
+    val fileName: String = ""
+)
+
+
 class OpenWrtException(message: String) : Exception(message)
 
 class OpenWrtClient(
-    private val http: HttpTransport = HttpTransport()
+    private val http: HttpTransport = HttpTransport(connectTimeoutMs = 12_000, readTimeoutMs = 180_000)
 ) {
     fun login(host: String, username: String, password: String, useHttps: Boolean = false): RouterSession {
         val base = normalizeBase(host, useHttps)
@@ -1384,8 +1403,10 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
 
     fun listProcesses(session: RouterSession): List<ProcessInfo> {
         val errors = mutableListOf<String>()
-        // busybox ps variants
+
+        // Prefer ps/top when file.exec is allowed
         val tries = listOf(
+            "top" to listOf("-bn1"),
             "ps" to listOf("w"),
             "ps" to listOf("-w"),
             "ps" to emptyList(),
@@ -1394,19 +1415,48 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         for ((cmd, params) in tries) {
             try {
                 val out = execCommand(session, cmd, params)
-                val parsed = parsePs(out)
-                if (parsed.isNotEmpty()) return parsed
+                val parsed = if (looksLikeTop(out)) parseTop(out) else parsePs(out)
+                if (parsed.isNotEmpty()) {
+                    val rich = parsed.any { it.cpu != "-" || it.mem != "-" || (it.rss != "-" && it.stat != "-") }
+                    if (rich) return parsed
+                    val enriched = runCatching { enrichProcessesFromProc(session, parsed) }.getOrDefault(parsed)
+                    if (enriched.isNotEmpty()) return enriched
+                }
             } catch (e: Exception) {
-                errors += "${cmd}${params}: ${e.message}"
+                errors += "$cmd: ${e.message}"
             }
         }
-        // /proc fallback: list numeric dirs + cmdline/status (no full CPU)
+
+        // /proc file.read fallback (works when file.exec is ACL-denied)
         return try {
             listProcessesFromProc(session)
         } catch (e: Exception) {
             throw OpenWrtException(
                 "无法获取进程列表。${errors.take(2).joinToString("；")}；proc: ${e.message}"
             )
+        }
+    }
+
+    fun killProcess(session: RouterSession, pid: String, force: Boolean = false): RouterActionResult {
+        val p = pid.trim()
+        if (p.isEmpty() || !p.all(Char::isDigit)) {
+            return RouterActionResult(false, "无效 PID")
+        }
+        if (p == "1") {
+            return RouterActionResult(false, "不能结束 PID 1 (procd/init)")
+        }
+        val signal = if (force) "9" else "15"
+        return try {
+            runCatching {
+                execCommand(session, "/bin/kill", listOf("-$signal", p))
+            }.recoverCatching {
+                execCommand(session, "/bin/busybox", listOf("kill", "-$signal", p))
+            }.recoverCatching {
+                execCommand(session, "kill", listOf("-$signal", p))
+            }.getOrThrow()
+            RouterActionResult(true, "已向 PID $p 发送 SIG${if (force) "KILL" else "TERM"}")
+        } catch (e: Exception) {
+            RouterActionResult(false, e.message ?: "结束进程失败（需要 file.exec 权限）")
         }
     }
 
@@ -1523,67 +1573,317 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         7 -> "DEBUG"
         else -> ""
     }
+    private fun looksLikeTop(text: String): Boolean {
+        val head = text.lineSequence().take(8).joinToString("\n").uppercase()
+        return head.contains("%CPU") || head.contains("CPU%") || (head.contains("MEM") && head.contains("PID") && head.contains("CPU"))
+    }
+
+    private fun parseTop(text: String): List<ProcessInfo> {
+        val lines = text.lineSequence().map { it.trimEnd() }.filter { it.isNotBlank() }.toList()
+        if (lines.isEmpty()) return emptyList()
+        val headerIdx = lines.indexOfFirst {
+            val u = it.uppercase()
+            u.contains("PID") && (u.contains("CPU") || u.contains("%CPU"))
+        }
+        if (headerIdx < 0) return parsePs(text)
+        val header = lines[headerIdx].trim().split(Regex("\\s+")).map { it.uppercase() }
+        fun col(names: List<String>): Int = names.firstNotNullOfOrNull { n -> header.indexOfFirst { it.contains(n) }.takeIf { it >= 0 } } ?: -1
+        val iPid = col(listOf("PID"))
+        val iUser = col(listOf("USER", "UID"))
+        val iCpu = col(listOf("%CPU", "CPU"))
+        val iMem = col(listOf("%MEM", "MEM"))
+        val iVsz = col(listOf("VSZ", "VIRT"))
+        val iRss = col(listOf("RSS", "RES"))
+        val iStat = col(listOf("STAT", "S"))
+        val iTime = col(listOf("TIME"))
+        val iCmd = col(listOf("COMMAND", "CMD", "ARGS"))
+        if (iPid < 0) return parsePs(text)
+        val out = ArrayList<ProcessInfo>(lines.size - headerIdx)
+        for (line in lines.drop(headerIdx + 1)) {
+            val parts = line.trim().split(Regex("\\s+"))
+            if (parts.size <= iPid) continue
+            val pid = parts.getOrNull(iPid) ?: continue
+            if (!pid.all(Char::isDigit)) continue
+            fun at(i: Int) = if (i >= 0) parts.getOrElse(i) { "-" } else "-"
+            val cmd = if (iCmd >= 0 && iCmd < parts.size) parts.drop(iCmd).joinToString(" ") else parts.last()
+            out += ProcessInfo(
+                pid = pid,
+                user = at(iUser),
+                cpu = at(iCpu).let { if (it == "-" ) "-" else it.trimEnd('%') },
+                mem = at(iMem).let { if (it == "-") "-" else it.trimEnd('%') },
+                vsz = at(iVsz),
+                rss = at(iRss),
+                tty = "-",
+                stat = at(iStat),
+                start = "-",
+                time = at(iTime),
+                command = cmd.ifBlank { "-" }
+            )
+        }
+        return out.distinctBy { it.pid + "|" + it.command }
+    }
 
     private fun listProcessesFromProc(session: RouterSession): List<ProcessInfo> {
         val names = fileListNames(session, "/proc")
         val pids = names.filter { it.all(Char::isDigit) }.sortedBy { it.toIntOrNull() ?: 0 }
-        val result = ArrayList<ProcessInfo>(pids.size.coerceAtMost(120))
-        for (pid in pids.take(120)) {
+        val memTotalKb = readMemTotalKb(session)
+        val uptimeSec = readUptimeSec(session)
+        val uidMap = loadPasswdUidMap(session)
+        val result = ArrayList<ProcessInfo>(pids.size.coerceAtMost(200))
+        for (pid in pids.take(200)) {
+            val status = runCatching { fileRead(session, "/proc/$pid/status", 4096) }.getOrDefault("")
+            val statRaw = runCatching { fileRead(session, "/proc/$pid/stat", 1024) }.getOrDefault("")
             val cmdline = runCatching {
                 fileRead(session, "/proc/$pid/cmdline", 512).replace('\u0000', ' ').trim()
             }.getOrDefault("")
-            val status = runCatching { fileRead(session, "/proc/$pid/status", 2048) }.getOrDefault("")
-            val name = status.lineSequence()
-                .firstOrNull { it.startsWith("Name:") }
-                ?.substringAfter(":")
-                ?.trim()
-                .orEmpty()
-            val rssKb = status.lineSequence()
-                .firstOrNull { it.startsWith("VmRSS:") }
+
+            val name = statusField(status, "Name").ifBlank {
+                parseProcStatComm(statRaw).ifBlank { pid }
+            }
+            val state = statusField(status, "State").substringBefore(" ").ifBlank {
+                parseProcStatFields(statRaw)?.state ?: "-"
+            }
+            val uid = statusField(status, "Uid").split(Regex("\\s+")).firstOrNull().orEmpty()
+            val rssKb = statusField(status, "VmRSS").substringBefore(" ").toLongOrNull() ?: 0L
+            val vszKb = statusField(status, "VmSize").substringBefore(" ").toLongOrNull() ?: 0L
+            val fields = parseProcStatFields(statRaw)
+            val user = uidMap[uid] ?: uid.ifBlank { "-" }
+            val cmd = cmdline.ifBlank { name.ifBlank { "[$pid]" } }
+            result += buildProcessInfo(
+                pid = pid,
+                user = user,
+                state = state,
+                rssKb = rssKb,
+                vszKb = vszKb,
+                utime = fields?.utime ?: 0L,
+                stime = fields?.stime ?: 0L,
+                starttime = fields?.starttime ?: 0L,
+                command = cmd,
+                memTotalKb = memTotalKb,
+                uptimeSec = uptimeSec
+            )
+        }
+        if (result.isEmpty()) throw OpenWrtException("/proc 无可用进程信息")
+        return result
+    }
+
+    private fun enrichProcessesFromProc(session: RouterSession, base: List<ProcessInfo>): List<ProcessInfo> {
+        val memTotalKb = readMemTotalKb(session)
+        val uptimeSec = readUptimeSec(session)
+        val uidMap = loadPasswdUidMap(session)
+        return base.map { p ->
+            if (p.cpu != "-" && p.mem != "-" && p.stat != "-") return@map p
+            val status = runCatching { fileRead(session, "/proc/${p.pid}/status", 4096) }.getOrDefault("")
+            val statRaw = runCatching { fileRead(session, "/proc/${p.pid}/stat", 1024) }.getOrDefault("")
+            if (status.isBlank() && statRaw.isBlank()) return@map p
+            val state = statusField(status, "State").substringBefore(" ").ifBlank {
+                parseProcStatFields(statRaw)?.state ?: p.stat
+            }
+            val uid = statusField(status, "Uid").split(Regex("\\s+")).firstOrNull().orEmpty()
+            val rssKb = statusField(status, "VmRSS").substringBefore(" ").toLongOrNull()
+                ?: p.rss.filter { it.isDigit() }.toLongOrNull() ?: 0L
+            val vszKb = statusField(status, "VmSize").substringBefore(" ").toLongOrNull()
+                ?: p.vsz.filter { it.isDigit() }.toLongOrNull() ?: 0L
+            val fields = parseProcStatFields(statRaw)
+            val built = buildProcessInfo(
+                pid = p.pid,
+                user = uidMap[uid] ?: p.user.ifBlank { uid.ifBlank { "-" } },
+                state = state.ifBlank { p.stat },
+                rssKb = rssKb,
+                vszKb = vszKb,
+                utime = fields?.utime ?: 0L,
+                stime = fields?.stime ?: 0L,
+                starttime = fields?.starttime ?: 0L,
+                command = p.command,
+                memTotalKb = memTotalKb,
+                uptimeSec = uptimeSec
+            )
+            built.copy(
+                cpu = if (p.cpu != "-") p.cpu else built.cpu,
+                mem = if (p.mem != "-") p.mem else built.mem
+            )
+        }
+    }
+
+    private data class ProcStatFields(
+        val state: String,
+        val utime: Long,
+        val stime: Long,
+        val starttime: Long
+    )
+
+    private fun parseProcStatComm(raw: String): String {
+        val l = raw.indexOf('(')
+        val r = raw.lastIndexOf(')')
+        if (l < 0 || r <= l) return ""
+        return raw.substring(l + 1, r)
+    }
+
+    private fun parseProcStatFields(raw: String): ProcStatFields? {
+        if (raw.isBlank()) return null
+        val l = raw.indexOf('(')
+        val r = raw.lastIndexOf(')')
+        if (l < 0 || r <= l) return null
+        val rest = raw.substring(r + 1).trim()
+        val f = rest.split(Regex("\\s+"))
+        // After comm: [0]=state [11]=utime [12]=stime [19]=starttime
+        if (f.size < 20) return null
+        return ProcStatFields(
+            state = f[0],
+            utime = f[11].toLongOrNull() ?: 0L,
+            stime = f[12].toLongOrNull() ?: 0L,
+            starttime = f[19].toLongOrNull() ?: 0L
+        )
+    }
+
+    private fun statusField(status: String, key: String): String {
+        val prefix = "$key:"
+        return status.lineSequence()
+            .firstOrNull { it.startsWith(prefix) }
+            ?.substringAfter(":")
+            ?.trim()
+            .orEmpty()
+    }
+
+    private fun readMemTotalKb(session: RouterSession): Long {
+        return runCatching {
+            fileRead(session, "/proc/meminfo", 2048)
+                .lineSequence()
+                .firstOrNull { it.startsWith("MemTotal:") }
                 ?.substringAfter(":")
                 ?.trim()
                 ?.substringBefore(" ")
-                .orEmpty()
-            val user = status.lineSequence()
-                .firstOrNull { it.startsWith("Uid:") }
-                ?.substringAfter(":")
-                ?.trim()
-                ?.split(Regex("\\s+"))
-                ?.firstOrNull()
-                .orEmpty()
-            val cmd = cmdline.ifBlank { name.ifBlank { "[$pid]" } }
-            result += ProcessInfo(
-                pid = pid,
-                user = user.ifBlank { "-" },
-                cpu = "-",
-                mem = "-",
-                vsz = "-",
-                rss = if (rssKb.isBlank()) "-" else rssKb,
-                tty = "-",
-                stat = "-",
-                start = "-",
-                time = "-",
-                command = cmd
-            )
+                ?.toLongOrNull()
+        }.getOrNull() ?: 0L
+    }
+
+    private fun readUptimeSec(session: RouterSession): Double {
+        return runCatching {
+            fileRead(session, "/proc/uptime", 64)
+                .trim()
+                .substringBefore(" ")
+                .toDoubleOrNull()
+        }.getOrNull() ?: 0.0
+    }
+
+    private fun loadPasswdUidMap(session: RouterSession): Map<String, String> {
+        val text = runCatching { fileRead(session, "/etc/passwd", 16_384) }.getOrDefault("")
+        if (text.isBlank()) return emptyMap()
+        val map = HashMap<String, String>()
+        for (line in text.lineSequence()) {
+            val p = line.split(':')
+            if (p.size >= 3) map[p[2]] = p[0]
         }
-        if (result.isEmpty()) throw OpenWrtException(" /proc 无可用进程信息")
-        return result
+        return map
+    }
+
+    private fun buildProcessInfo(
+        pid: String,
+        user: String,
+        state: String,
+        rssKb: Long,
+        vszKb: Long,
+        utime: Long,
+        stime: Long,
+        starttime: Long,
+        command: String,
+        memTotalKb: Long,
+        uptimeSec: Double
+    ): ProcessInfo {
+        val hz = 100.0
+        val ticks = utime + stime
+        val startSec = starttime / hz
+        val live = (uptimeSec - startSec).coerceAtLeast(0.01)
+        val cpuPct = if (uptimeSec > 0.0 && ticks > 0L) {
+            String.format(java.util.Locale.US, "%.1f", 100.0 * ticks / hz / live)
+        } else if (ticks == 0L) {
+            "0.0"
+        } else {
+            "-"
+        }
+        val memPct = if (memTotalKb > 0L && rssKb > 0L) {
+            String.format(java.util.Locale.US, "%.1f", rssKb * 100.0 / memTotalKb)
+        } else if (rssKb == 0L) {
+            "0.0"
+        } else {
+            "-"
+        }
+        return ProcessInfo(
+            pid = pid,
+            user = user.ifBlank { "-" },
+            cpu = cpuPct,
+            mem = memPct,
+            vsz = if (vszKb > 0) vszKb.toString() else "-",
+            rss = if (rssKb > 0) rssKb.toString() else if (rssKb == 0L) "0" else "-",
+            tty = "-",
+            stat = state.ifBlank { "-" },
+            start = "-",
+            time = formatCpuTime(ticks),
+            command = command.ifBlank { "-" }
+        )
+    }
+
+    private fun formatCpuTime(ticks: Long): String {
+        val sec = (ticks / 100L).coerceAtLeast(0L)
+        val h = sec / 3600
+        val m = (sec % 3600) / 60
+        val s = sec % 60
+        return if (h > 0) String.format(java.util.Locale.US, "%d:%02d:%02d", h, m, s)
+        else String.format(java.util.Locale.US, "%d:%02d", m, s)
     }
 
     private fun parsePs(text: String): List<ProcessInfo> {
         val lines = text.lineSequence().map { it.trimEnd() }.filter { it.isNotBlank() }.toList()
         if (lines.isEmpty()) return emptyList()
-        val body = if (lines.first().contains("PID", ignoreCase = true) ||
-            lines.first().contains("USER", ignoreCase = true)
-        ) lines.drop(1) else lines
+        val first = lines.first()
+        val hasHeader = first.contains("PID", ignoreCase = true) || first.contains("USER", ignoreCase = true)
+        val body = if (hasHeader) lines.drop(1) else lines
+        // header-aware columns when present
+        if (hasHeader) {
+            val header = first.trim().split(Regex("\\s+")).map { it.uppercase() }
+            fun col(vararg names: String): Int =
+                names.firstNotNullOfOrNull { n -> header.indexOfFirst { it == n || it.contains(n) }.takeIf { it >= 0 } } ?: -1
+            val iPid = col("PID")
+            val iUser = col("USER", "UID")
+            val iCpu = col("%CPU", "CPU")
+            val iMem = col("%MEM", "MEM")
+            val iVsz = col("VSZ", "VIRT")
+            val iRss = col("RSS", "RES")
+            val iStat = col("STAT", "S")
+            val iTime = col("TIME")
+            val iCmd = col("COMMAND", "CMD", "ARGS")
+            if (iPid >= 0) {
+                val out = ArrayList<ProcessInfo>(body.size)
+                for (line in body) {
+                    val parts = line.trim().split(Regex("\\s+"))
+                    if (parts.size <= iPid) continue
+                    val pid = parts.getOrNull(iPid) ?: continue
+                    if (!pid.all(Char::isDigit)) continue
+                    fun at(i: Int) = if (i >= 0) parts.getOrElse(i) { "-" } else "-"
+                    val cmd = if (iCmd >= 0 && iCmd < parts.size) parts.drop(iCmd).joinToString(" ") else parts.drop(iPid + 1).joinToString(" ")
+                    out += ProcessInfo(
+                        pid = pid,
+                        user = at(iUser),
+                        cpu = at(iCpu).trimEnd('%'),
+                        mem = at(iMem).trimEnd('%'),
+                        vsz = at(iVsz),
+                        rss = at(iRss),
+                        tty = "-",
+                        stat = at(iStat),
+                        start = "-",
+                        time = at(iTime),
+                        command = cmd.ifBlank { "-" }
+                    )
+                }
+                if (out.isNotEmpty()) return out.distinctBy { it.pid + "|" + it.command }
+            }
+        }
         val out = ArrayList<ProcessInfo>(body.size)
         for (line in body) {
             val parts = line.trim().split(Regex("\\s+"))
             if (parts.isEmpty()) continue
-            // busybox: USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
-            // or: PID USER VSZ STAT COMMAND
+            // busybox: PID USER VSZ STAT COMMAND
             if (parts[0].all(Char::isDigit)) {
-                // PID first
                 val pid = parts[0]
                 if (parts.size >= 5) {
                     out += ProcessInfo(
@@ -1601,6 +1901,7 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
                     )
                 } else continue
             } else if (parts.size >= 11 && parts[1].all(Char::isDigit)) {
+                // USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
                 out += ProcessInfo(
                     pid = parts[1],
                     user = parts[0],
@@ -1615,8 +1916,7 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
                     command = parts.drop(10).joinToString(" ").ifBlank { "-" }
                 )
             } else if (parts.size >= 2) {
-                // last resort: find first numeric as pid
-                val pidIdx = parts.indexOfFirst { it.all(Char::isDigit) && it.length <= 6 }
+                val pidIdx = parts.indexOfFirst { it.all(Char::isDigit) && it.length <= 7 }
                 if (pidIdx < 0) continue
                 out += ProcessInfo(
                     pid = parts[pidIdx],
@@ -1635,7 +1935,6 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         }
         return out.distinctBy { it.pid + "|" + it.command }
     }
-
     private fun parseLogLines(text: String, limit: Int): List<LogLine> {
         val lines = text.lineSequence().map { it.trimEnd() }.filter { it.isNotBlank() }.toList()
         if (lines.isEmpty()) return emptyList()
@@ -1843,6 +2142,215 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         }
         return list
     }
+
+    // region Backup / Flash / MTD
+
+    fun listMtdPartitions(session: RouterSession): List<MtdPartition> {
+        val text = runCatching {
+            fileRead(session, "/proc/mtd", maxBytes = 16_384)
+        }.getOrDefault("").ifBlank {
+            runCatching { execCommand(session, "/bin/cat", listOf("/proc/mtd")) }.getOrDefault("")
+        }
+        if (text.isBlank()) return emptyList()
+        val list = mutableListOf<MtdPartition>()
+        // mtd0: 00100000 00020000 "BL2"
+        val re = Regex("mtd(\\d+):\\s+([0-9a-fA-F]+)\\s+([0-9a-fA-F]+)\\s+\\"([^\\"]*)\\"")
+        text.lineSequence().forEach { line ->
+            val m = re.find(line.trim()) ?: return@forEach
+            val idx = m.groupValues[1].toIntOrNull() ?: return@forEach
+            val size = m.groupValues[2].toLongOrNull(16) ?: 0L
+            val erase = m.groupValues[3].toLongOrNull(16) ?: 0L
+            val name = m.groupValues[4]
+            list += MtdPartition(
+                index = idx,
+                dev = "mtd$idx",
+                name = name.ifBlank { "mtd$idx" },
+                size = size,
+                erasesize = erase
+            )
+        }
+        return list
+    }
+
+    fun createConfigBackup(session: RouterSession): BinaryActionResult {
+        return try {
+            val path = "/tmp/openwrt-backup-${System.currentTimeMillis()}.tar.gz"
+            val out = runCatching {
+                execCommand(session, "/sbin/sysupgrade", listOf("-b", path))
+            }.getOrElse {
+                execCommand(session, "/usr/bin/sysupgrade", listOf("-b", path))
+            }
+            // verify file exists via stat/read
+            val bytes = runCatching { fileReadBytes(session, path) }.getOrNull()
+            runCatching { execCommand(session, "/bin/rm", listOf("-f", path)) }
+            if (bytes == null || bytes.isEmpty()) {
+                BinaryActionResult(
+                    false,
+                    "生成备份失败（需要 sysupgrade 与 file.read 权限）。$out".trim()
+                )
+            } else {
+                BinaryActionResult(
+                    true,
+                    "备份已生成（${bytes.size} 字节），请选择保存位置",
+                    bytes,
+                    "openwrt-backup.tar.gz"
+                )
+            }
+        } catch (e: Exception) {
+            BinaryActionResult(false, e.message ?: "生成备份失败")
+        }
+    }
+
+    fun factoryReset(session: RouterSession): RouterActionResult {
+        return try {
+            // Prefer firstboot; fall back to jffs2reset
+            val ok = runCatching {
+                execCommand(session, "/sbin/firstboot", listOf("-y"))
+                true
+            }.getOrElse {
+                runCatching {
+                    execCommand(session, "/sbin/jffs2reset", listOf("-y"))
+                    true
+                }.getOrDefault(false)
+            }
+            if (!ok) {
+                // shell one-liner
+                runCatching {
+                    execCommand(session, "/bin/sh", listOf("-c", "firstboot -y || jffs2reset -y"))
+                }
+            }
+            // Reboot after reset
+            runCatching { reboot(session) }
+            RouterActionResult(true, "已执行恢复出厂，路由器正在重启")
+        } catch (e: Exception) {
+            RouterActionResult(false, e.message ?: "恢复出厂失败")
+        }
+    }
+
+    fun restoreConfigBackup(session: RouterSession, data: ByteArray): RouterActionResult {
+        if (data.isEmpty()) return RouterActionResult(false, "备份文件为空")
+        return try {
+            val path = "/tmp/openwrt-restore.tar.gz"
+            fileWriteBytes(session, path, data)
+            runCatching {
+                execCommand(session, "/sbin/sysupgrade", listOf("-r", path))
+            }.getOrElse {
+                execCommand(session, "/usr/bin/sysupgrade", listOf("-r", path))
+            }
+            runCatching { reboot(session) }
+            RouterActionResult(true, "配置已恢复，路由器正在重启")
+        } catch (e: Exception) {
+            RouterActionResult(false, e.message ?: "恢复配置失败")
+        }
+    }
+
+    fun downloadMtdPartition(session: RouterSession, part: MtdPartition): BinaryActionResult {
+        if (part.size <= 0L) return BinaryActionResult(false, "无效分区")
+        if (part.size > 64L * 1024L * 1024L) {
+            return BinaryActionResult(false, "分区过大（>${64}MB），请用 SSH/串口工具导出")
+        }
+        return try {
+            val tmp = "/tmp/${part.dev}-${part.name.replace(Regex("[^A-Za-z0-9._-]"), "_")}.bin"
+            // Prefer dd from char device /dev/mtdX ro
+            val script = "dd if=/dev/${part.dev} of=$tmp bs=4096 2>/dev/null || " +
+                "dd if=/dev/mtdblock${part.index} of=$tmp bs=4096 2>/dev/null"
+            execCommand(session, "/bin/sh", listOf("-c", script))
+            val bytes = fileReadBytes(session, tmp)
+            runCatching { execCommand(session, "/bin/rm", listOf("-f", tmp)) }
+            if (bytes.isEmpty()) {
+                BinaryActionResult(false, "读取 ${part.dev} 失败（可能缺少 file.exec/read 权限）")
+            } else {
+                BinaryActionResult(
+                    true,
+                    "已导出 ${part.dev} (${part.name})，${bytes.size} 字节",
+                    bytes,
+                    "${part.dev}-${part.name}.bin"
+                )
+            }
+        } catch (e: Exception) {
+            BinaryActionResult(false, e.message ?: "导出 mtd 失败")
+        }
+    }
+
+    fun flashFirmware(session: RouterSession, data: ByteArray, keepSettings: Boolean): RouterActionResult {
+        if (data.isEmpty()) return RouterActionResult(false, "固件文件为空")
+        if (data.size < 64 * 1024) return RouterActionResult(false, "固件文件过小，可能不是有效镜像")
+        return try {
+            val path = "/tmp/firmware-sysupgrade.bin"
+            fileWriteBytes(session, path, data)
+            val args = if (keepSettings) {
+                listOf(path)
+            } else {
+                listOf("-n", path)
+            }
+            // sysupgrade will reboot by itself on success
+            runCatching {
+                execCommand(session, "/sbin/sysupgrade", args)
+            }.getOrElse {
+                execCommand(session, "/usr/bin/sysupgrade", args)
+            }
+            RouterActionResult(true, "已提交固件升级，设备将自动重启（请等待数分钟）")
+        } catch (e: Exception) {
+            RouterActionResult(false, e.message ?: "固件升级失败")
+        }
+    }
+
+    private fun fileReadBytes(session: RouterSession, path: String, chunk: Int = 256 * 1024): ByteArray {
+        val out = ByteArrayOutputStream()
+        var offset = 0
+        var guard = 0
+        while (guard++ < 4096) {
+            val result = ubusCall(
+                session,
+                "file",
+                "read",
+                JSONObject()
+                    .put("path", path)
+                    .put("base64", true)
+                    .put("offset", offset)
+                    .put("length", chunk)
+            )
+            val data = result.optJSONObject(1) ?: break
+            val b64 = data.optString("data", data.optString("content", ""))
+            if (b64.isBlank()) break
+            val part = try {
+                Base64.decode(b64, Base64.DEFAULT)
+            } catch (_: Exception) {
+                break
+            }
+            if (part.isEmpty()) break
+            out.write(part)
+            offset += part.size
+            if (part.size < chunk) break
+        }
+        return out.toByteArray()
+    }
+
+    private fun fileWriteBytes(session: RouterSession, path: String, bytes: ByteArray, chunk: Int = 192 * 1024) {
+        var offset = 0
+        var append = false
+        while (offset < bytes.size) {
+            val end = minOf(offset + chunk, bytes.size)
+            val slice = bytes.copyOfRange(offset, end)
+            val b64 = Base64.encodeToString(slice, Base64.NO_WRAP)
+            ubusCall(
+                session,
+                "file",
+                "write",
+                JSONObject()
+                    .put("path", path)
+                    .put("data", b64)
+                    .put("base64", true)
+                    .put("append", append)
+                    .put("mode", 420) // 0644
+            )
+            append = true
+            offset = end
+        }
+    }
+
+    // endregion
+
 
     fun changePassword(session: RouterSession, username: String, newPassword: String): RouterActionResult {
         if (newPassword.isBlank()) return RouterActionResult(false, "新密码不能为空")

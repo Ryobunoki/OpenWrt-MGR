@@ -1,4 +1,7 @@
 package com.openwrt.mgr.ui.screens
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.ButtonDefaults
 
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.ui.window.DialogProperties
@@ -202,6 +205,7 @@ fun AppRoot(
     onToolsSectionChange: (ToolsSection) -> Unit,
     onRefreshProcesses: () -> Unit,
     onProcessQueryChange: (String) -> Unit,
+    onKillProcess: (String) -> Unit = {},
     onThemeStyleChange: (ThemeStyle) -> Unit,
     onThemeModeChange: (ThemeMode) -> Unit,
     onAppIconStyleChange: (AppIconStyle) -> Unit,
@@ -228,7 +232,16 @@ fun AppRoot(
     onNewPasswordChange: (String) -> Unit = {},
     onConfirmPasswordChange: (String) -> Unit = {},
     onChangePassword: () -> Unit = {},
-    onAppLanguageChange: (AppLanguage) -> Unit = {}
+    onAppLanguageChange: (AppLanguage) -> Unit = {},
+    onGenerateBackup: () -> Unit = {},
+    onFactoryReset: () -> Unit = {},
+    onRestoreBackup: (ByteArray) -> Unit = {},
+    onRefreshMtd: () -> Unit = {},
+    onSelectMtd: (Int) -> Unit = {},
+    onDownloadMtd: () -> Unit = {},
+    onKeepSettingsChange: (Boolean) -> Unit = {},
+    onFlashFirmware: (ByteArray) -> Unit = {},
+    onPendingDownloadSaved: () -> Unit = {}
 ) {
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(state.statusMessage, state.errorMessage) {
@@ -442,9 +455,19 @@ Surface(
                         onRefresh = onRefresh,
                         onRefreshProcesses = onRefreshProcesses,
                         onProcessQueryChange = onProcessQueryChange,
+                        onKillProcess = onKillProcess,
                         onNewPasswordChange = onNewPasswordChange,
                         onConfirmPasswordChange = onConfirmPasswordChange,
-                        onChangePassword = onChangePassword
+                        onChangePassword = onChangePassword,
+                        onGenerateBackup = onGenerateBackup,
+                        onFactoryReset = onFactoryReset,
+                        onRestoreBackup = onRestoreBackup,
+                        onRefreshMtd = onRefreshMtd,
+                        onSelectMtd = onSelectMtd,
+                        onDownloadMtd = onDownloadMtd,
+                        onKeepSettingsChange = onKeepSettingsChange,
+                        onFlashFirmware = onFlashFirmware,
+                        onPendingDownloadSaved = onPendingDownloadSaved
                     )
                     AppTab.THEME -> ThemeTab(
                         state = state,
@@ -1780,11 +1803,63 @@ private fun ActionsTab(
     onRefresh: () -> Unit,
     onRefreshProcesses: () -> Unit,
     onProcessQueryChange: (String) -> Unit,
+    onKillProcess: (String) -> Unit = {},
     onNewPasswordChange: (String) -> Unit = {},
     onConfirmPasswordChange: (String) -> Unit = {},
-    onChangePassword: () -> Unit = {}
+    onChangePassword: () -> Unit = {},
+    onGenerateBackup: () -> Unit = {},
+    onFactoryReset: () -> Unit = {},
+    onRestoreBackup: (ByteArray) -> Unit = {},
+    onRefreshMtd: () -> Unit = {},
+    onSelectMtd: (Int) -> Unit = {},
+    onDownloadMtd: () -> Unit = {},
+    onKeepSettingsChange: (Boolean) -> Unit = {},
+    onFlashFirmware: (ByteArray) -> Unit = {},
+    onPendingDownloadSaved: () -> Unit = {}
 ) {
     val l10n = LocalL10n.current
+    val context = LocalContext.current
+
+    val createDoc = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri: Uri? ->
+        val bytes = state.pendingDownloadBytes
+        if (uri != null && bytes != null) {
+            runCatching {
+                context.contentResolver.openOutputStream(uri)?.use { os ->
+                    os.write(bytes)
+                    os.flush()
+                }
+            }
+        }
+        onPendingDownloadSaved()
+    }
+    LaunchedEffect(state.pendingDownloadNonce, state.pendingDownloadName, state.pendingDownloadBytes) {
+        val name = state.pendingDownloadName
+        if (state.pendingDownloadBytes != null && !name.isNullOrBlank()) {
+            createDoc.launch(name)
+        }
+    }
+
+    val pickRestore = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        runCatching {
+            context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        }.getOrNull()?.let { onRestoreBackup(it) }
+    }
+    val pickFirmware = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        runCatching {
+            context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        }.getOrNull()?.let { onFlashFirmware(it) }
+    }
+
+    var confirmFactory by remember { mutableStateOf(false) }
+    var mtdMenuExpanded by remember { mutableStateOf(false) }
 
     Column(
         Modifier
@@ -1792,15 +1867,21 @@ private fun ActionsTab(
             .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             listOf(
                 ToolsSection.ACTIONS to l10n.tabActions,
+                ToolsSection.BACKUP to l10n.backupFlash,
                 ToolsSection.PROCESSES to l10n.processes
             ).forEach { (sec, label) ->
                 FilterChip(
                     selected = state.toolsSection == sec,
                     onClick = { onSectionChange(sec) },
-                    label = { Text(label) },
+                    label = { Text(label, maxLines = 1) },
                     leadingIcon = if (state.toolsSection == sec) {
                         { Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }
                     } else null
@@ -1811,9 +1892,7 @@ private fun ActionsTab(
         when (state.toolsSection) {
             ToolsSection.ACTIONS -> {
                 Column(
-                    Modifier
-                        .fillMaxSize()
-                        .verticalScroll(rememberScrollState()),
+                    Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(l10n.quickActions, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
@@ -1839,31 +1918,149 @@ private fun ActionsTab(
                         label = { Text(l10n.confirmPassword) },
                         visualTransformation = PasswordVisualTransformation()
                     )
-                    FilledTonalButton(
-                        onClick = onChangePassword,
-                        enabled = !loading && state.newPassword.isNotBlank(),
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(14.dp)
-                    ) { Text(l10n.t("update_user_password", state.username)) }
+                    Button(onClick = onChangePassword, enabled = !loading, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp)) { Text(l10n.changePassword) }
                 }
             }
-            ToolsSection.PROCESSES -> ProcessesPane(
-                state = state,
-                onRefresh = onRefreshProcesses,
-                onQueryChange = onProcessQueryChange
-            )
+
+            ToolsSection.BACKUP -> {
+                Column(
+                    Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    GlassCard {
+                        Text(l10n.backupSection, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                        Text(l10n.backupHint, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(8.dp))
+                        FilledTonalButton(onClick = onGenerateBackup, enabled = !loading, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp)) {
+                            Text(l10n.generateBackup)
+                        }
+                    }
+
+                    GlassCard {
+                        Text(l10n.restoreSection, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                        Text(l10n.factoryResetHint, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(8.dp))
+                        Button(
+                            onClick = { confirmFactory = true },
+                            enabled = !loading,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                        ) { Text(l10n.factoryReset) }
+                        Spacer(Modifier.height(8.dp))
+                        Text(l10n.restoreHint, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedButton(
+                            onClick = { pickRestore.launch(arrayOf("application/*", "*/*")) },
+                            enabled = !loading,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(14.dp)
+                        ) { Text(l10n.uploadRestore) }
+                    }
+
+                    GlassCard {
+                        Text(l10n.mtdSection, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                        Text(l10n.mtdHint, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(onClick = onRefreshMtd, enabled = !loading, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp)) {
+                            Text(l10n.refreshMtd)
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        val parts = state.mtdPartitions
+                        if (parts.isEmpty()) {
+                            Text("-", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else {
+                            val selected = parts.getOrNull(state.selectedMtdIndex) ?: parts.first()
+                            Box {
+                                OutlinedButton(
+                                    onClick = { mtdMenuExpanded = true },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(14.dp)
+                                ) {
+                                    Text("${selected.dev} · ${selected.name} · ${formatBytes(selected.size)}", maxLines = 1)
+                                }
+                                DropdownMenu(expanded = mtdMenuExpanded, onDismissRequest = { mtdMenuExpanded = false }) {
+                                    parts.forEachIndexed { idx, p ->
+                                        DropdownMenuItem(
+                                            text = { Text("${p.dev} · ${p.name} · ${formatBytes(p.size)}") },
+                                            onClick = {
+                                                onSelectMtd(idx)
+                                                mtdMenuExpanded = false
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            FilledTonalButton(onClick = onDownloadMtd, enabled = !loading, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp)) {
+                                Text(l10n.saveMtd)
+                            }
+                        }
+                    }
+
+                    GlassCard {
+                        Text(l10n.flashSection, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                        Text(l10n.flashHint, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(8.dp))
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth().clickable { onKeepSettingsChange(!state.keepSettingsOnFlash) }
+                        ) {
+                            Checkbox(checked = state.keepSettingsOnFlash, onCheckedChange = onKeepSettingsChange, enabled = !loading)
+                            Text(l10n.keepSettings, color = MaterialTheme.colorScheme.onSurface)
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Button(
+                            onClick = { pickFirmware.launch(arrayOf("application/octet-stream", "application/*", "*/*")) },
+                            enabled = !loading,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(14.dp)
+                        ) { Text(l10n.uploadFirmware) }
+                    }
+                }
+            }
+
+            ToolsSection.PROCESSES -> {
+                ProcessesPane(
+                    state = state,
+                    onRefresh = onRefreshProcesses,
+                    onQueryChange = onProcessQueryChange,
+                    onKillProcess = onKillProcess
+                )
+            }
+
             ToolsSection.LOGS -> Unit
         }
     }
+
+    if (confirmFactory) {
+        AlertDialog(
+            onDismissRequest = { confirmFactory = false },
+            title = { Text(l10n.factoryReset) },
+            text = { Text(l10n.confirmFactoryReset) },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmFactory = false
+                    onFactoryReset()
+                }) { Text(l10n.confirm) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmFactory = false }) { Text(l10n.cancel) }
+            }
+        )
+    }
 }
+
 
 @Composable
 private fun ProcessesPane(
     state: UiState,
     onRefresh: () -> Unit,
-    onQueryChange: (String) -> Unit
+    onQueryChange: (String) -> Unit,
+    onKillProcess: (String) -> Unit = {}
 ) {
     val l10n = LocalL10n.current
+    var pendingKill by remember { mutableStateOf<ProcessInfo?>(null) }
 
     val q = state.processQuery.trim()
     val list = remember(state.processes, q) {
@@ -1910,24 +2107,76 @@ private fun ProcessesPane(
                     }
                 }
             }
-            items(list, key = { it.pid + it.command }) { p ->
+            items(list, key = { it.pid + "|" + it.command }) { p ->
                 GlassCard {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text("PID ${p.pid}", fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
-                        Text(p.user, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.Top,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text(
+                                    "PID ${p.pid}",
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Text(
+                                    p.user,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Spacer(Modifier.height(4.dp))
+                            Text(p.command, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                "CPU ${fmtPct(p.cpu)}  MEM ${fmtPct(p.mem)}  RSS ${p.rss}  STAT ${p.stat}  TIME ${p.time}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        IconButton(
+                            onClick = { pendingKill = p },
+                            enabled = p.pid != "1" && !state.processesLoading && !state.isLoading
+                        ) {
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = l10n.killProcess,
+                                tint = if (p.pid == "1") MaterialTheme.colorScheme.onSurface.copy(alpha = 0.3f)
+                                else MaterialTheme.colorScheme.error
+                            )
+                        }
                     }
-                    Spacer(Modifier.height(4.dp))
-                    Text(p.command, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "CPU ${p.cpu}  MEM ${p.mem}  RSS ${p.rss}  STAT ${p.stat}  TIME ${p.time}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
                 }
             }
         }
     }
+
+    pendingKill?.let { target ->
+        AlertDialog(
+            onDismissRequest = { pendingKill = null },
+            title = { Text(l10n.killProcess) },
+            text = {
+                Text(l10n.t("confirm_kill_process", target.pid) + "\n${target.command}")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val pid = target.pid
+                    pendingKill = null
+                    onKillProcess(pid)
+                }) { Text(l10n.confirm) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingKill = null }) { Text(l10n.cancel) }
+            }
+        )
+    }
+}
+
+private fun fmtPct(v: String): String {
+    if (v.isBlank() || v == "-") return "-"
+    return if (v.endsWith("%")) v else "$v%"
 }
 
 @Composable

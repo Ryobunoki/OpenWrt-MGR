@@ -6,7 +6,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.Modifier
@@ -49,7 +48,8 @@ class MainActivity : ComponentActivity() {
                         onToolsSectionChange = viewModel::setToolsSection,
                         onRefreshProcesses = viewModel::refreshProcesses,
                         onProcessQueryChange = viewModel::updateProcessQuery,
-                                                onThemeStyleChange = viewModel::setThemeStyle,
+                        onKillProcess = viewModel::killProcess,
+                        onThemeStyleChange = viewModel::setThemeStyle,
                         onThemeModeChange = viewModel::setThemeMode,
                         onAppIconStyleChange = viewModel::setAppIconStyle,
                         onBackgroundStyleChange = viewModel::setBackgroundStyle,
@@ -76,6 +76,15 @@ class MainActivity : ComponentActivity() {
                         onConfirmPasswordChange = viewModel::updateConfirmPassword,
                         onChangePassword = viewModel::changeUserPassword,
                         onAppLanguageChange = viewModel::setAppLanguage,
+                        onGenerateBackup = viewModel::generateBackup,
+                        onFactoryReset = viewModel::factoryReset,
+                        onRestoreBackup = viewModel::restoreBackup,
+                        onRefreshMtd = viewModel::refreshMtdPartitions,
+                        onSelectMtd = viewModel::selectMtdIndex,
+                        onDownloadMtd = viewModel::downloadSelectedMtd,
+                        onKeepSettingsChange = viewModel::setKeepSettingsOnFlash,
+                        onFlashFirmware = viewModel::flashFirmware,
+                        onPendingDownloadSaved = viewModel::clearPendingDownload,
                     )
                 }
             }

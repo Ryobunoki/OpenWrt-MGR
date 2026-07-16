@@ -23,6 +23,8 @@ import com.openwrt.mgr.data.LogLine
 import com.openwrt.mgr.data.RouterSession
 import com.openwrt.mgr.data.SystemInfo
 import com.openwrt.mgr.data.WirelessInterface
+import com.openwrt.mgr.data.MtdPartition
+import com.openwrt.mgr.data.BinaryActionResult
 import com.openwrt.mgr.ui.i18n.AppLanguage
 import com.openwrt.mgr.ui.i18n.L10nCatalog
 import com.openwrt.mgr.ui.theme.AppIconStyle
@@ -40,7 +42,7 @@ import java.io.FileOutputStream
 
 enum class AppTab { OVERVIEW, DEVICES, WIFI, PLUGINS, SSH, ACTIONS, THEME }
 
-enum class ToolsSection { ACTIONS, PROCESSES, LOGS }
+enum class ToolsSection { ACTIONS, BACKUP, PROCESSES, LOGS }
 
 data class UiState(
     val host: String = OpenWrtClient.DEFAULT_HOST,
@@ -67,6 +69,12 @@ data class UiState(
     val pluginsError: String? = null,
     // System tools (inside Actions tab)
     val toolsSection: ToolsSection = ToolsSection.ACTIONS,
+    val mtdPartitions: List<MtdPartition> = emptyList(),
+    val selectedMtdIndex: Int = 0,
+    val keepSettingsOnFlash: Boolean = true,
+    val pendingDownloadBytes: ByteArray? = null,
+    val pendingDownloadName: String? = null,
+    val pendingDownloadNonce: Long = 0L,
     val processes: List<ProcessInfo> = emptyList(),
     val processQuery: String = "",
     val processesLoading: Boolean = false,
@@ -607,6 +615,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
         when (section) {
             ToolsSection.PROCESSES -> if (state.processes.isEmpty() && !state.processesLoading) refreshProcesses()
             ToolsSection.LOGS -> if (state.systemLogs.isEmpty() && !state.logsLoading) refreshLogs()
+            ToolsSection.BACKUP -> if (state.mtdPartitions.isEmpty()) refreshMtdPartitions()
             ToolsSection.ACTIONS -> Unit
         }
     }
@@ -640,6 +649,27 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
                     processesLoading = false,
                     processesError = e.message ?: l10n().processFetchFailed
                 )
+            }
+        }
+    }
+
+    fun killProcess(pid: String) {
+        val session = state.session ?: return
+        viewModelScope.launch {
+            state = state.copy(isLoading = true, errorMessage = null, statusMessage = null)
+            val result = withContext(Dispatchers.IO) {
+                runCatching { client.killProcess(session, pid, force = false) }
+                    .getOrElse { com.openwrt.mgr.data.RouterActionResult(false, it.message ?: l10n().t("kill_failed")) }
+            }
+            if (result.success) {
+                state = state.copy(isLoading = false, statusMessage = result.message)
+                // refresh list after kill
+                runCatching {
+                    val list = withContext(Dispatchers.IO) { client.listProcesses(session) }
+                    state = state.copy(processes = list, processesError = null)
+                }
+            } else {
+                state = state.copy(isLoading = false, errorMessage = result.message)
             }
         }
     }
@@ -715,7 +745,117 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-private fun runAction(block: (RouterSession) -> com.openwrt.mgr.data.RouterActionResult) {
+
+    fun refreshMtdPartitions() {
+        val session = state.session ?: return
+        viewModelScope.launch {
+            val list = withContext(Dispatchers.IO) {
+                runCatching { client.listMtdPartitions(session) }.getOrDefault(emptyList())
+            }
+            state = state.copy(
+                mtdPartitions = list,
+                selectedMtdIndex = state.selectedMtdIndex.coerceIn(0, (list.size - 1).coerceAtLeast(0))
+            )
+        }
+    }
+
+    fun selectMtdIndex(index: Int) {
+        state = state.copy(selectedMtdIndex = index.coerceAtLeast(0))
+    }
+
+    fun setKeepSettingsOnFlash(keep: Boolean) {
+        state = state.copy(keepSettingsOnFlash = keep)
+    }
+
+    fun generateBackup() {
+        val session = state.session ?: return
+        viewModelScope.launch {
+            state = state.copy(isLoading = true, errorMessage = null, statusMessage = null)
+            val result = withContext(Dispatchers.IO) {
+                runCatching { client.createConfigBackup(session) }
+                    .getOrElse { BinaryActionResult(false, it.message ?: l10n().operationFailed) }
+            }
+            state = if (result.success && result.bytes != null) {
+                state.copy(
+                    isLoading = false,
+                    statusMessage = result.message,
+                    pendingDownloadBytes = result.bytes,
+                    pendingDownloadName = result.fileName.ifBlank { "openwrt-backup.tar.gz" },
+                    pendingDownloadNonce = System.currentTimeMillis()
+                )
+            } else {
+                state.copy(isLoading = false, errorMessage = result.message)
+            }
+        }
+    }
+
+    fun factoryReset() = runAction { client.factoryReset(it) }
+
+    fun restoreBackup(bytes: ByteArray) {
+        val session = state.session ?: return
+        viewModelScope.launch {
+            state = state.copy(isLoading = true, errorMessage = null, statusMessage = null)
+            val result = withContext(Dispatchers.IO) {
+                runCatching { client.restoreConfigBackup(session, bytes) }
+                    .getOrElse { com.openwrt.mgr.data.RouterActionResult(false, it.message ?: l10n().operationFailed) }
+            }
+            state = if (result.success) {
+                state.copy(isLoading = false, statusMessage = result.message)
+            } else {
+                state.copy(isLoading = false, errorMessage = result.message)
+            }
+        }
+    }
+
+    fun downloadSelectedMtd() {
+        val session = state.session ?: return
+        val part = state.mtdPartitions.getOrNull(state.selectedMtdIndex) ?: run {
+            state = state.copy(errorMessage = l10n().t("select_mtd_first"))
+            return
+        }
+        viewModelScope.launch {
+            state = state.copy(isLoading = true, errorMessage = null, statusMessage = null)
+            val result = withContext(Dispatchers.IO) {
+                runCatching { client.downloadMtdPartition(session, part) }
+                    .getOrElse { BinaryActionResult(false, it.message ?: l10n().operationFailed) }
+            }
+            state = if (result.success && result.bytes != null) {
+                state.copy(
+                    isLoading = false,
+                    statusMessage = result.message,
+                    pendingDownloadBytes = result.bytes,
+                    pendingDownloadName = result.fileName.ifBlank { "${part.dev}.bin" },
+                    pendingDownloadNonce = System.currentTimeMillis()
+                )
+            } else {
+                state.copy(isLoading = false, errorMessage = result.message)
+            }
+        }
+    }
+
+    fun flashFirmware(bytes: ByteArray) {
+        val session = state.session ?: return
+        val keep = state.keepSettingsOnFlash
+        viewModelScope.launch {
+            state = state.copy(isLoading = true, errorMessage = null, statusMessage = null)
+            val result = withContext(Dispatchers.IO) {
+                runCatching { client.flashFirmware(session, bytes, keep) }
+                    .getOrElse { com.openwrt.mgr.data.RouterActionResult(false, it.message ?: l10n().operationFailed) }
+            }
+            state = if (result.success) {
+                state.copy(isLoading = false, statusMessage = result.message)
+            } else {
+                state.copy(isLoading = false, errorMessage = result.message)
+            }
+        }
+    }
+
+    fun clearPendingDownload() {
+        state = state.copy(pendingDownloadBytes = null, pendingDownloadName = null)
+    }
+
+
+    private fun runAction(block: (RouterSession) -> com.openwrt.mgr.data.RouterActionResult) {
         val session = state.session ?: return
         viewModelScope.launch {
             state = state.copy(isLoading = true, errorMessage = null, statusMessage = null)
