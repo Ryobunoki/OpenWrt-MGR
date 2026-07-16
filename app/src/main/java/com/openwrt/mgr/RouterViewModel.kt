@@ -341,7 +341,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
                     isLoading = false,
                     isLoggedIn = false,
                     session = null,
-                    errorMessage = e.message ?: l10n().loginFailed
+                    errorMessage = localizeActionMessage(e.message ?: "ERR_LOGIN_FAILED")
                 )
             }
         }
@@ -428,7 +428,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
                     statusMessage = if (showGlobalLoading) l10n().pluginsUpdated else state.statusMessage
                 )
             } catch (e: Exception) {
-                val msg = e.message ?: l10n().pluginsRefreshFailed
+                val msg = localizeActionMessage(e.message ?: "ERR_PLUGIN_SCAN")
                 state = state.copy(
                     isLoading = if (showGlobalLoading) false else state.isLoading,
                     pluginsLoading = false,
@@ -440,6 +440,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
     }
 
 
+
     private fun privilegedSession(): com.openwrt.mgr.data.RouterSession? {
         val s = state.session ?: return null
         // Re-attach login password/SSH port so file.exec ACL-denied ops can fall back to SSH.
@@ -449,24 +450,76 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
     private fun localizeActionMessage(raw: String?): String {
         val msg = raw.orEmpty()
         val L = l10n()
+        fun arg(prefix: String): String = msg.removePrefix(prefix)
         return when {
-            msg.startsWith("OK_PLUGIN_ENABLED:") -> L.t("plugin_enabled", msg.removePrefix("OK_PLUGIN_ENABLED:"))
-            msg.startsWith("OK_PLUGIN_DISABLED:") -> L.t("plugin_disabled", msg.removePrefix("OK_PLUGIN_DISABLED:"))
-            msg.startsWith("OK_PLUGIN_RESTARTED:") -> L.t("plugin_restarted", msg.removePrefix("OK_PLUGIN_RESTARTED:"))
+            msg.startsWith("OK_PLUGIN_ENABLED:") -> L.t("plugin_enabled", arg("OK_PLUGIN_ENABLED:"))
+            msg.startsWith("OK_PLUGIN_DISABLED:") -> L.t("plugin_disabled", arg("OK_PLUGIN_DISABLED:"))
+            msg.startsWith("OK_PLUGIN_RESTARTED:") -> L.t("plugin_restarted", arg("OK_PLUGIN_RESTARTED:"))
             msg.startsWith("OK_KILL_SENT:") -> {
-                val parts = msg.removePrefix("OK_KILL_SENT:").split(":")
+                val parts = arg("OK_KILL_SENT:").split(":")
                 L.t("kill_sent", parts.getOrNull(0).orEmpty(), parts.getOrNull(1) ?: "TERM")
             }
+            msg.startsWith("OK_BACKUP:") -> L.t("backup_ready", arg("OK_BACKUP:"))
+            msg.startsWith("OK_MTD_EXPORT:") -> {
+                val p = arg("OK_MTD_EXPORT:").split(":")
+                L.t("mtd_exported", p.getOrNull(0).orEmpty(), p.getOrNull(1).orEmpty(), p.getOrNull(2).orEmpty())
+            }
+            msg == "OK_REBOOT" -> L.t("ok_reboot")
+            msg == "OK_NETWORK_RESTART" -> L.t("ok_network_restart")
+            msg == "OK_WIFI_RELOAD" -> L.t("ok_wifi_reload")
+            msg == "OK_FACTORY_RESET" -> L.t("ok_factory_reset")
+            msg == "OK_RESTORE" -> L.t("ok_restore")
+            msg == "OK_FW_FLASH" -> L.t("ok_fw_flash")
+            msg == "OK_PWD_CHANGED" -> L.t("ok_pwd_changed")
+
             msg == "ERR_PLUGIN_NO_INIT" -> L.t("plugin_no_init")
             msg == "ERR_FILE_EXEC_ACL" || msg == "ERR_FILE_EXEC_NEED_SSH" || msg == "ERR_EXEC_FAILED" ->
                 L.t("plugin_exec_denied")
-            msg.startsWith("ERR_SSH_FALLBACK:") ->
-                L.t("plugin_ssh_fallback_failed", msg.removePrefix("ERR_SSH_FALLBACK:"))
-            msg.startsWith("ERR_PLUGIN_CONTROL:") ->
-                L.t("plugin_control_failed", msg.removePrefix("ERR_PLUGIN_CONTROL:"))
+            msg.startsWith("ERR_SSH_FALLBACK:") -> L.t("plugin_ssh_fallback_failed", arg("ERR_SSH_FALLBACK:"))
+            msg.startsWith("ERR_PLUGIN_CONTROL:") -> L.t("plugin_control_failed", arg("ERR_PLUGIN_CONTROL:"))
+            msg.startsWith("ERR_PLUGIN_SCAN:") -> L.t("plugin_scan_failed", arg("ERR_PLUGIN_SCAN:"))
             msg == "ERR_KILL_INVALID_PID" -> L.t("kill_invalid_pid")
             msg == "ERR_KILL_PID1" -> L.t("kill_pid1")
             msg == "SSH_NOT_CONNECTED" -> L.sshNotConnected
+            msg == "ERR_HTTPS_CERT" -> L.t("err_https_cert")
+            msg == "ERR_LOGIN_FAILED" -> L.loginFailed
+            msg.startsWith("ERR_LOGIN_HTTP:") -> L.t("err_login_http", arg("ERR_LOGIN_HTTP:"))
+            msg == "ERR_LOGIN_INVALID" -> L.t("err_login_invalid")
+            msg == "ERR_LOGIN_BAD_CREDS" -> L.t("err_login_bad_creds")
+            msg == "ERR_LOGIN_NO_SESSION" || msg == "ERR_LOGIN_NO_TOKEN" -> L.t("err_login_no_session")
+            msg == "ERR_REBOOT" -> L.rebootFailed
+            msg == "ERR_NETWORK_RESTART" -> L.t("err_network_restart")
+            msg == "ERR_WIFI_RELOAD" -> L.t("err_wifi_reload")
+            msg.startsWith("ERR_PROCESS_LIST:") -> L.t("err_process_list", arg("ERR_PROCESS_LIST:"))
+            msg == "ERR_PROCESS_EMPTY" -> L.t("err_process_empty")
+            msg.startsWith("ERR_LOGS:") -> L.t("err_logs", arg("ERR_LOGS:"))
+            msg.startsWith("ERR_BACKUP:") -> L.t("err_backup", arg("ERR_BACKUP:"))
+            msg == "ERR_BACKUP" -> L.t("err_backup", "")
+            msg == "ERR_BACKUP_EMPTY" -> L.t("err_backup_empty")
+            msg == "ERR_FACTORY_RESET" -> L.t("err_factory_reset")
+            msg == "ERR_RESTORE" -> L.t("err_restore")
+            msg == "ERR_MTD_INVALID" -> L.t("err_mtd_invalid")
+            msg == "ERR_MTD_TOO_LARGE" -> L.t("err_mtd_too_large")
+            msg.startsWith("ERR_MTD_READ:") -> L.t("err_mtd_read", arg("ERR_MTD_READ:"))
+            msg == "ERR_MTD_EXPORT" -> L.t("err_mtd_export")
+            msg == "ERR_FW_EMPTY" -> L.t("err_fw_empty")
+            msg == "ERR_FW_TOO_SMALL" -> L.t("err_fw_too_small")
+            msg == "ERR_FW_FLASH" -> L.t("err_fw_flash")
+            msg == "ERR_PWD_EMPTY" -> L.t("err_pwd_empty")
+            msg == "ERR_PWD_EXEC_DENIED" -> L.t("err_pwd_exec_denied")
+            msg == "ERR_PWD_CHANGE" -> L.changePasswordFailed
+            msg.startsWith("ERR_PWD_CHANGE:") -> L.t("err_pwd_change_detail", arg("ERR_PWD_CHANGE:"))
+            msg == "ERR_UBUS_SESSION" || msg == "ERR_NO_SESSION" -> L.t("err_no_session")
+            msg.startsWith("ERR_LUCI_UBUS:") -> L.t("err_luci_ubus", arg("ERR_LUCI_UBUS:"))
+            msg.startsWith("ERR_HTTP:") -> L.t("err_http", arg("ERR_HTTP:"))
+            msg.startsWith("ERR_EMPTY") -> L.t("err_empty_response")
+            msg == "ERR_PARSE" -> L.t("err_parse")
+            msg == "ERR_UBUS" -> L.t("err_ubus")
+            msg == "ERR_FILE_WRITE_ACL" -> L.t("err_file_write_acl")
+            msg == "ERR_FILE_READ_ACL" -> L.t("err_file_read_acl")
+            msg.startsWith("ERR_UBUS_CALL:file.write") -> L.t("err_file_write_acl")
+            msg.startsWith("ERR_UBUS_CALL:file.read") -> L.t("err_file_read_acl")
+            msg.startsWith("ERR_UBUS_CALL:") -> L.t("err_ubus_call", arg("ERR_UBUS_CALL:"))
             msg.contains("code=6") || msg.contains("file.exec", ignoreCase = true) -> L.t("plugin_exec_denied")
             msg == "SSH 已断开" -> L.sshDisconnected
             else -> msg.ifBlank { L.operationFailed }
@@ -586,8 +639,8 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
                 state = state.copy(
                     sshConnecting = false,
                     sshConnected = false,
-                    sshStatus = e.message ?: l10n().sshConnectFailed,
-                    errorMessage = e.message ?: l10n().sshConnectFailed
+                    sshStatus = localizeActionMessage(e.message ?: l10n().sshConnectFailed),
+                    errorMessage = localizeActionMessage(e.message ?: l10n().sshConnectFailed)
                 )
             }
         }
@@ -690,7 +743,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: Exception) {
                 state = state.copy(
                     processesLoading = false,
-                    processesError = e.message ?: l10n().processFetchFailed
+                    processesError = localizeActionMessage(e.message ?: "ERR_PROCESS_LIST")
                 )
             }
         }
@@ -733,7 +786,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: Exception) {
                 state = state.copy(
                     logsLoading = false,
-                    logsError = e.message ?: l10n().logsFetchFailed
+                    logsError = localizeActionMessage(e.message ?: "ERR_LOGS")
                 )
             }
         }
@@ -776,8 +829,8 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
             }
             state = state.copy(
                 isLoading = false,
-                statusMessage = if (result.success) result.message else null,
-                errorMessage = if (!result.success) result.message else null,
+                statusMessage = if (result.success) localizeActionMessage(result.message) else null,
+                errorMessage = if (!result.success) localizeActionMessage(result.message) else null,
                 password = if (result.success) {
                     if (state.rememberPassword) prefs.edit().putString("password", np).apply()
                     np
@@ -790,7 +843,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
 
 
     fun refreshMtdPartitions() {
-        val session = state.session ?: return
+        val session = privilegedSession() ?: return
         viewModelScope.launch {
             val list = withContext(Dispatchers.IO) {
                 runCatching { client.listMtdPartitions(session) }.getOrDefault(emptyList())
@@ -843,15 +896,15 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
                     .getOrElse { com.openwrt.mgr.data.RouterActionResult(false, it.message ?: l10n().operationFailed) }
             }
             state = if (result.success) {
-                state.copy(isLoading = false, statusMessage = result.message)
+                state.copy(isLoading = false, statusMessage = localizeActionMessage(result.message))
             } else {
-                state.copy(isLoading = false, errorMessage = result.message)
+                state.copy(isLoading = false, errorMessage = localizeActionMessage(result.message))
             }
         }
     }
 
     fun downloadSelectedMtd() {
-        val session = state.session ?: return
+        val session = privilegedSession() ?: return
         val part = state.mtdPartitions.getOrNull(state.selectedMtdIndex) ?: run {
             state = state.copy(errorMessage = l10n().t("select_mtd_first"))
             return
@@ -865,13 +918,13 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
             state = if (result.success && result.bytes != null) {
                 state.copy(
                     isLoading = false,
-                    statusMessage = result.message,
+                    statusMessage = localizeActionMessage(result.message),
                     pendingDownloadBytes = result.bytes,
                     pendingDownloadName = result.fileName.ifBlank { "${part.dev}.bin" },
                     pendingDownloadNonce = System.currentTimeMillis()
                 )
             } else {
-                state.copy(isLoading = false, errorMessage = result.message)
+                state.copy(isLoading = false, errorMessage = localizeActionMessage(result.message))
             }
         }
     }
@@ -886,9 +939,9 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
                     .getOrElse { com.openwrt.mgr.data.RouterActionResult(false, it.message ?: l10n().operationFailed) }
             }
             state = if (result.success) {
-                state.copy(isLoading = false, statusMessage = result.message)
+                state.copy(isLoading = false, statusMessage = localizeActionMessage(result.message))
             } else {
-                state.copy(isLoading = false, errorMessage = result.message)
+                state.copy(isLoading = false, errorMessage = localizeActionMessage(result.message))
             }
         }
     }

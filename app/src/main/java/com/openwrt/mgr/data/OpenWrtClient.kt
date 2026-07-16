@@ -176,13 +176,10 @@ class OpenWrtClient(
             }
 
             if (isSsl) {
-                throw OpenWrtException(
-                    "HTTPS 证书不受信任（路由器多为自签名证书）。" +
-                        "请安装最新 APK；或取消勾选“使用 HTTPS”改用 HTTP。"
-                )
+                throw OpenWrtException("ERR_HTTPS_CERT")
             }
             if (e is OpenWrtException) throw e
-            throw OpenWrtException(e.message ?: "登录失败")
+            throw OpenWrtException(e.message ?: "ERR_LOGIN_FAILED")
         }
     }
 
@@ -199,7 +196,7 @@ class OpenWrtClient(
 
         val msg = (ubusResult.exceptionOrNull() as? OpenWrtException)?.message
             ?: ubusResult.exceptionOrNull()?.message
-            ?: "登录失败"
+            ?: "ERR_LOGIN_FAILED"
         throw OpenWrtException(msg)
     }
 
@@ -247,23 +244,23 @@ class OpenWrtClient(
         run {
             val text = response.body
             if (!response.isSuccessful) {
-                throw OpenWrtException("登录失败 (HTTP ${response.code})")
+                throw OpenWrtException("ERR_LOGIN_HTTP:${response.code}")
             }
             val root = JSONObject(text)
             if (root.has("error")) {
-                throw OpenWrtException(root.getJSONObject("error").optString("message", "登录失败"))
+                throw OpenWrtException(root.getJSONObject("error").optString("message", "ERR_LOGIN_FAILED"))
             }
             val result = root.optJSONArray("result")
-                ?: throw OpenWrtException("登录响应无效")
+                ?: throw OpenWrtException("ERR_LOGIN_INVALID")
             val code = result.optInt(0, -1)
             if (code != 0) {
-                throw OpenWrtException("用户名或密码错误")
+                throw OpenWrtException("ERR_LOGIN_BAD_CREDS")
             }
             val data = result.optJSONObject(1)
-                ?: throw OpenWrtException("未获取到会话")
+                ?: throw OpenWrtException("ERR_LOGIN_NO_SESSION")
             val ubusToken = data.optString("ubus_rpc_session")
             if (ubusToken.isBlank()) {
-                throw OpenWrtException("未获取到会话令牌")
+                throw OpenWrtException("ERR_LOGIN_NO_TOKEN")
             }
             return RouterSession(baseUrl = base, username = username, authToken = "ubus:$ubusToken")
         }
@@ -277,7 +274,7 @@ class OpenWrtClient(
                 hostname = "OpenWrt",
                 model = "-",
                 boardName = "-",
-                releaseDescription = if (session.isUbus) "已连接" else "已登录 LuCI",
+                releaseDescription = if (session.isUbus) "connected" else "LuCI",
                 kernelVersion = "-",
                 localTime = "-",
                 uptimeSeconds = 0L,
@@ -316,9 +313,9 @@ class OpenWrtClient(
             } else {
                 luciRpc(session, """{"method":"exec","params":["reboot"]}""")
             }
-            RouterActionResult(true, "已发送重启指令")
+            RouterActionResult(true, "OK_REBOOT")
         } catch (e: Exception) {
-            RouterActionResult(false, e.message ?: "重启失败")
+            RouterActionResult(false, e.message ?: "ERR_REBOOT")
         }
     }
 
@@ -329,9 +326,9 @@ class OpenWrtClient(
             } else {
                 luciRpc(session, """{"method":"exec","params":["/etc/init.d/network restart"]}""")
             }
-            RouterActionResult(true, "网络服务正在重启")
+            RouterActionResult(true, "OK_NETWORK_RESTART")
         } catch (e: Exception) {
-            RouterActionResult(false, e.message ?: "网络重启失败")
+            RouterActionResult(false, e.message ?: "ERR_NETWORK_RESTART")
         }
     }
 
@@ -349,9 +346,9 @@ class OpenWrtClient(
             } else {
                 luciRpc(session, """{"method":"exec","params":["wifi reload"]}""")
             }
-            RouterActionResult(true, "Wi-Fi 已重新加载")
+            RouterActionResult(true, "OK_WIFI_RELOAD")
         } catch (e: Exception) {
-            RouterActionResult(false, e.message ?: "Wi-Fi 重载失败")
+            RouterActionResult(false, e.message ?: "ERR_WIFI_RELOAD")
         }
     }
 
@@ -1025,14 +1022,14 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
                     }
                 }
             }
-        }.onFailure { errors += "opkg信息: ${it.message}" }
+        }.onFailure { errors += "opkg-info: ${it.message}" }
 
         // 2) Fallback: partial read of /usr/lib/opkg/status (large file; only first chunk)
         if (opkgPackages.isEmpty()) {
             runCatching {
                 val status = fileRead(session, "/usr/lib/opkg/status", 256 * 1024)
                 parseOpkgStatus(status).forEach { (k, v) -> opkgPackages[k] = v }
-            }.onFailure { errors += "opkg状态: ${it.message}" }
+            }.onFailure { errors += "opkg-status: ${it.message}" }
         }
 
         // 3) init.d scripts
@@ -1142,11 +1139,8 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
 
         // If every source failed hard, surface error
         if (opkgPackages.isEmpty() && initScripts.isEmpty() && pathHits.isEmpty() && execProbe.isBlank()) {
-            val detail = errors.joinToString("；").ifBlank { "无可用 ubus file 权限" }
-            throw OpenWrtException(
-                "插件扫描失败：$detail。当前路由器可能限制了 file.list/file.read/file.exec。" +
-                    "可在路由器添加 ACL 允许 root 调用 file.*，或至少允许 file.list 与 file.stat。"
-            )
+            val detail = errors.joinToString("; ").ifBlank { "no-ubus-file" }
+            throw OpenWrtException("ERR_PLUGIN_SCAN:$detail")
         }
 
         return known.map { (id, name, desc) ->
@@ -1470,7 +1464,7 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
             listProcessesFromProc(session)
         } catch (e: Exception) {
             throw OpenWrtException(
-                "无法获取进程列表。${errors.take(2).joinToString("；")}；proc: ${e.message}"
+                "ERR_PROCESS_LIST:${errors.take(2).joinToString("; ")}; proc: ${e.message}"
             )
         }
     }
@@ -1596,7 +1590,7 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
             errors += "kmsg: ${e.message}"
         }
         throw OpenWrtException(
-            "无法读取系统日志（路由器可能限制 file.exec）。${errors.take(3).joinToString("；")}。可在 SSH 中执行 logread。"
+            "ERR_LOGS:${errors.take(3).joinToString("; ")}"
         )
     }
 
@@ -1701,7 +1695,7 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
                 uptimeSec = uptimeSec
             )
         }
-        if (result.isEmpty()) throw OpenWrtException("/proc 无可用进程信息")
+        if (result.isEmpty()) throw OpenWrtException("ERR_PROCESS_EMPTY")
         return result
     }
 
@@ -2282,7 +2276,7 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
             if (bytes.isNotEmpty()) {
                 return BinaryActionResult(
                     true,
-                    "备份已生成（${bytes.size} 字节），请选择保存位置",
+                    "OK_BACKUP:${bytes.size}",
                     bytes,
                     "openwrt-backup.tar.gz"
                 )
@@ -2318,18 +2312,18 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
             if (bytes == null || bytes.isEmpty()) {
                 BinaryActionResult(
                     false,
-                    "生成备份失败（需要 sysupgrade/file.read 或 SSH）。$out".trim()
+                    "ERR_BACKUP:$out".trim()
                 )
             } else {
                 BinaryActionResult(
                     true,
-                    "备份已生成（${bytes.size} 字节），请选择保存位置",
+                    "OK_BACKUP:${bytes.size}",
                     bytes,
                     "openwrt-backup.tar.gz"
                 )
             }
         } catch (e: Exception) {
-            BinaryActionResult(false, e.message ?: "生成备份失败")
+            BinaryActionResult(false, e.message ?: "ERR_BACKUP")
         }
     }
 
@@ -2373,60 +2367,112 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
             }
             // Reboot after reset
             runCatching { reboot(session) }
-            RouterActionResult(true, "已执行恢复出厂，路由器正在重启")
+            RouterActionResult(true, "OK_FACTORY_RESET")
         } catch (e: Exception) {
-            RouterActionResult(false, e.message ?: "恢复出厂失败")
+            RouterActionResult(false, e.message ?: "ERR_FACTORY_RESET")
         }
     }
 
     fun restoreConfigBackup(session: RouterSession, data: ByteArray): RouterActionResult {
-        if (data.isEmpty()) return RouterActionResult(false, "备份文件为空")
+        if (data.isEmpty()) return RouterActionResult(false, "ERR_BACKUP_EMPTY")
         return try {
             val path = "/tmp/openwrt-restore.tar.gz"
             fileWriteBytes(session, path, data)
             runCatching {
                 execCommand(session, "/sbin/sysupgrade", listOf("-r", path))
-            }.getOrElse {
+            }.recoverCatching {
                 execCommand(session, "/usr/bin/sysupgrade", listOf("-r", path))
-            }
+            }.recoverCatching {
+                // some builds only have tar restore path
+                execCommand(
+                    session,
+                    "/bin/sh",
+                    listOf("-c", "sysupgrade -r ${shellQuote(path)} || tar xz -C / -f ${shellQuote(path)}")
+                )
+            }.getOrThrow()
             runCatching { reboot(session) }
-            RouterActionResult(true, "配置已恢复，路由器正在重启")
+            RouterActionResult(true, "OK_RESTORE")
         } catch (e: Exception) {
-            RouterActionResult(false, e.message ?: "恢复配置失败")
+            val msg = e.message.orEmpty()
+            RouterActionResult(
+                false,
+                when {
+                    msg.startsWith("ERR_") -> msg
+                    msg.contains("file.write") || msg.contains("code=6") -> "ERR_FILE_WRITE_ACL"
+                    else -> msg.ifBlank { "ERR_RESTORE" }
+                }
+            )
         }
     }
 
     fun downloadMtdPartition(session: RouterSession, part: MtdPartition): BinaryActionResult {
-        if (part.size <= 0L) return BinaryActionResult(false, "无效分区")
+        if (part.size <= 0L) return BinaryActionResult(false, "ERR_MTD_INVALID")
         if (part.size > 64L * 1024L * 1024L) {
-            return BinaryActionResult(false, "分区过大（>${64}MB），请用 SSH/串口工具导出")
+            return BinaryActionResult(false, "ERR_MTD_TOO_LARGE")
         }
         return try {
+            // 1) Prefer direct SSH stream (works when file.read is ACL-denied)
+            if (canSshFallback(session)) {
+                val b64 = runCatching {
+                    execViaSsh(
+                        session,
+                        "/bin/sh",
+                        listOf(
+                            "-c",
+                            "dd if=/dev/${part.dev} bs=4096 2>/dev/null | base64 || " +
+                                "dd if=/dev/mtdblock${part.index} bs=4096 2>/dev/null | base64 || " +
+                                "busybox dd if=/dev/${part.dev} bs=4096 2>/dev/null | busybox base64"
+                        )
+                    )
+                }.getOrDefault("")
+                if (b64.isNotBlank()) {
+                    val bytes = runCatching {
+                        Base64.decode(b64.replace(Regex("\\s"), ""), Base64.DEFAULT)
+                    }.getOrNull()
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        return BinaryActionResult(
+                            true,
+                            "OK_MTD_EXPORT:${part.dev}:${part.name}:${bytes.size}",
+                            bytes,
+                            "${part.dev}-${part.name}.bin"
+                        )
+                    }
+                }
+            }
+
+            // 2) dd to /tmp then file.read (ubus) / SSH base64 pull
             val tmp = "/tmp/${part.dev}-${part.name.replace(Regex("[^A-Za-z0-9._-]"), "_")}.bin"
-            // Prefer dd from char device /dev/mtdX ro
             val script = "dd if=/dev/${part.dev} of=$tmp bs=4096 2>/dev/null || " +
                 "dd if=/dev/mtdblock${part.index} of=$tmp bs=4096 2>/dev/null"
             execCommand(session, "/bin/sh", listOf("-c", script))
             val bytes = fileReadBytes(session, tmp)
             runCatching { execCommand(session, "/bin/rm", listOf("-f", tmp)) }
             if (bytes.isEmpty()) {
-                BinaryActionResult(false, "读取 ${part.dev} 失败（可能缺少 file.exec/read 权限）")
+                BinaryActionResult(false, "ERR_MTD_READ:${part.dev}")
             } else {
                 BinaryActionResult(
                     true,
-                    "已导出 ${part.dev} (${part.name})，${bytes.size} 字节",
+                    "OK_MTD_EXPORT:${part.dev}:${part.name}:${bytes.size}",
                     bytes,
                     "${part.dev}-${part.name}.bin"
                 )
             }
         } catch (e: Exception) {
-            BinaryActionResult(false, e.message ?: "导出 mtd 失败")
+            val msg = e.message.orEmpty()
+            BinaryActionResult(
+                false,
+                when {
+                    msg.startsWith("ERR_") -> msg
+                    msg.contains("file.read") || msg.contains("code=8") -> "ERR_FILE_READ_ACL"
+                    else -> msg.ifBlank { "ERR_MTD_EXPORT" }
+                }
+            )
         }
     }
 
     fun flashFirmware(session: RouterSession, data: ByteArray, keepSettings: Boolean): RouterActionResult {
-        if (data.isEmpty()) return RouterActionResult(false, "固件文件为空")
-        if (data.size < 64 * 1024) return RouterActionResult(false, "固件文件过小，可能不是有效镜像")
+        if (data.isEmpty()) return RouterActionResult(false, "ERR_FW_EMPTY")
+        if (data.size < 64 * 1024) return RouterActionResult(false, "ERR_FW_TOO_SMALL")
         return try {
             val path = "/tmp/firmware-sysupgrade.bin"
             fileWriteBytes(session, path, data)
@@ -2441,13 +2487,41 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
             }.getOrElse {
                 execCommand(session, "/usr/bin/sysupgrade", args)
             }
-            RouterActionResult(true, "已提交固件升级，设备将自动重启（请等待数分钟）")
+            RouterActionResult(true, "OK_FW_FLASH")
         } catch (e: Exception) {
-            RouterActionResult(false, e.message ?: "固件升级失败")
+            val msg = e.message.orEmpty()
+            RouterActionResult(
+                false,
+                when {
+                    msg.startsWith("ERR_") -> msg
+                    msg.contains("file.write") || msg.contains("code=6") -> "ERR_FILE_WRITE_ACL"
+                    else -> msg.ifBlank { "ERR_FW_FLASH" }
+                }
+            )
         }
     }
 
+    private fun canSshFallback(session: RouterSession): Boolean =
+        session.hasExecFallback || session.password.isNotBlank()
+
     private fun fileReadBytes(session: RouterSession, path: String, chunk: Int = 256 * 1024): ByteArray {
+        val ubusErr: Exception? = try {
+            val bytes = fileReadBytesUbus(session, path, chunk)
+            if (bytes.isNotEmpty()) return bytes
+            null
+        } catch (e: Exception) {
+            e
+        }
+        if (canSshFallback(session)) {
+            val viaSsh = runCatching { fileReadBytesSsh(session, path) }.getOrNull()
+            if (viaSsh != null && viaSsh.isNotEmpty()) return viaSsh
+            if (viaSsh != null && viaSsh.isEmpty() && ubusErr == null) return viaSsh
+        }
+        if (ubusErr != null) throw mapFileIoError(ubusErr, "read")
+        return ByteArray(0)
+    }
+
+    private fun fileReadBytesUbus(session: RouterSession, path: String, chunk: Int): ByteArray {
         val out = ByteArrayOutputStream()
         var offset = 0
         var guard = 0
@@ -2478,7 +2552,46 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         return out.toByteArray()
     }
 
+    private fun fileReadBytesSsh(session: RouterSession, path: String): ByteArray {
+        val safe = path
+        val b64 = execViaSsh(
+            session,
+            "/bin/sh",
+            listOf(
+                "-c",
+                "base64 ${shellQuote(safe)} 2>/dev/null || busybox base64 ${shellQuote(safe)} 2>/dev/null || " +
+                    "openssl base64 -A -in ${shellQuote(safe)} 2>/dev/null"
+            )
+        )
+        if (b64.isBlank()) return ByteArray(0)
+        return try {
+            Base64.decode(b64.replace(Regex("\\s"), ""), Base64.DEFAULT)
+        } catch (_: Exception) {
+            ByteArray(0)
+        }
+    }
+
     private fun fileWriteBytes(session: RouterSession, path: String, bytes: ByteArray, chunk: Int = 192 * 1024) {
+        val ubusErr: Exception? = try {
+            fileWriteBytesUbus(session, path, bytes, chunk)
+            return
+        } catch (e: Exception) {
+            e
+        }
+        if (canSshFallback(session)) {
+            try {
+                fileWriteBytesSsh(session, path, bytes)
+                return
+            } catch (sshEx: Exception) {
+                throw OpenWrtException(
+                    "ERR_SSH_FALLBACK:${sshEx.message?.take(160) ?: "write failed"}"
+                )
+            }
+        }
+        throw mapFileIoError(ubusErr, "write")
+    }
+
+    private fun fileWriteBytesUbus(session: RouterSession, path: String, bytes: ByteArray, chunk: Int) {
         var offset = 0
         var append = false
         while (offset < bytes.size) {
@@ -2501,11 +2614,42 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         }
     }
 
+    private fun fileWriteBytesSsh(session: RouterSession, path: String, bytes: ByteArray) {
+        val host = session.hostForSsh()
+        val cmd = "cat > ${shellQuote(path)}"
+        val (code, out) = SshClient.execOnceWithInput(
+            host = host,
+            port = session.sshPort,
+            username = session.username.ifBlank { "root" },
+            password = session.password,
+            command = cmd,
+            input = bytes,
+            timeoutMs = 300_000
+        )
+        if (code != 0) {
+            throw OpenWrtException("ERR_SSH_FALLBACK:write code=$code ${out.take(80)}")
+        }
+    }
+
+    private fun mapFileIoError(e: Exception?, op: String): OpenWrtException {
+        val msg = e?.message.orEmpty()
+        return when {
+            msg.startsWith("ERR_") -> OpenWrtException(msg)
+            msg.contains("file.write") || (op == "write" && (msg.contains("code=6") || msg.contains(":6"))) ->
+                OpenWrtException("ERR_FILE_WRITE_ACL")
+            msg.contains("file.read") || (op == "read" && (msg.contains("code=6") || msg.contains("code=8") || msg.contains(":8") || msg.contains(":6"))) ->
+                OpenWrtException("ERR_FILE_READ_ACL")
+            msg.contains("code=6") -> OpenWrtException("ERR_FILE_WRITE_ACL")
+            msg.isNotBlank() -> OpenWrtException(msg)
+            else -> OpenWrtException(if (op == "write") "ERR_FILE_WRITE_ACL" else "ERR_FILE_READ_ACL")
+        }
+    }
+
     // endregion
 
 
     fun changePassword(session: RouterSession, username: String, newPassword: String): RouterActionResult {
-        if (newPassword.isBlank()) return RouterActionResult(false, "新密码不能为空")
+        if (newPassword.isBlank()) return RouterActionResult(false, "ERR_PWD_EMPTY")
         val user = username.ifBlank { "root" }
         // 1) luci setPassword
         val luci = runCatching {
@@ -2515,7 +2659,7 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
                 "setPassword",
                 JSONObject().put("username", user).put("password", newPassword)
             )
-            RouterActionResult(true, "密码已更新")
+            RouterActionResult(true, "OK_PWD_CHANGED")
         }.getOrNull()
         if (luci?.success == true) return luci
         // 2) file.exec passwd via chpasswd
@@ -2523,12 +2667,15 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
             execCommand(session, "/bin/sh", listOf("-c", "echo ${shellQuote("$user:$newPassword")} | chpasswd"))
             true
         }.getOrDefault(false)
-        if (execOk) return RouterActionResult(true, "密码已通过 chpasswd 更新")
-        val msg = luci?.message ?: "修改密码失败"
+        if (execOk) return RouterActionResult(true, "OK_PWD_CHANGED")
+        val msg = luci?.message ?: "ERR_PWD_CHANGE"
         return RouterActionResult(
             false,
-            if (msg.contains("code=6")) "路由器禁止执行命令（file.exec），无法改密。请在 LuCI 网页修改，或放行 ubus file.exec / luci.setPassword。"
-            else msg
+            when {
+                msg.contains("code=6") || msg.startsWith("ERR_FILE_EXEC") || msg.startsWith("ERR_SSH") -> "ERR_PWD_EXEC_DENIED"
+                msg.startsWith("ERR_") -> msg
+                else -> "ERR_PWD_CHANGE:$msg"
+            }
         )
     }
 
@@ -2741,7 +2888,7 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         params: JSONObject
     ): JSONArray {
         val token = session.ubusToken
-            ?: throw OpenWrtException("无效的 ubus 会话")
+            ?: throw OpenWrtException("ERR_UBUS_SESSION")
         val payload = JSONObject()
             .put("jsonrpc", "2.0")
             .put("id", System.currentTimeMillis() % 100000)
@@ -2767,7 +2914,7 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         params: JSONObject
     ): JSONArray {
         val cookie = session.luciCookie
-            ?: throw OpenWrtException("无有效会话，请重新登录")
+            ?: throw OpenWrtException("ERR_NO_SESSION")
         val cookieHeader = "sysauth=$cookie; sysauth_http=$cookie; sysauth_https=$cookie"
         val payloadVariants = listOf(
             JSONObject()
@@ -2801,17 +2948,17 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         }
         throw OpenWrtException(
             lastError?.message
-                ?: "LuCI 会话无法调用 ubus（$obj.$method）。请重新登录以获取 ubus 令牌。"
+                ?: "ERR_LUCI_UBUS:$obj.$method"
         )
     }
 
     private fun parseUbusResponse(response: HttpTransport.HttpResponse, obj: String, method: String): JSONArray {
         val text = response.body
         if (!response.isSuccessful) {
-            throw OpenWrtException("请求失败 HTTP ${response.code}")
+            throw OpenWrtException("ERR_HTTP:${response.code}")
         }
         if (text.isBlank()) {
-            throw OpenWrtException("空响应 ($obj.$method)")
+            throw OpenWrtException("ERR_EMPTY:$obj.$method")
         }
         val root = try {
             JSONObject(text)
@@ -2820,18 +2967,18 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
             if (arr.length() > 0 && arr.optJSONObject(0) != null) {
                 arr.getJSONObject(0)
             } else {
-                throw OpenWrtException("无法解析响应")
+                throw OpenWrtException("ERR_PARSE")
             }
         }
         if (root.has("error")) {
             val err = root.optJSONObject("error")
-            throw OpenWrtException(err?.optString("message") ?: "ubus 错误")
+            throw OpenWrtException(err?.optString("message") ?: "ERR_UBUS")
         }
         val result = root.optJSONArray("result")
-            ?: throw OpenWrtException("空响应")
+            ?: throw OpenWrtException("ERR_EMPTY")
         val code = result.optInt(0, -1)
         if (code != 0) {
-            throw OpenWrtException("ubus 调用失败 ($obj.$method code=$code)")
+            throw OpenWrtException("ERR_UBUS_CALL:$obj.$method:$code")
         }
         return result
     }
@@ -2844,7 +2991,7 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
             mapOf("Cookie" to "sysauth=$cookie; sysauth_http=$cookie")
         )
         if (!response.isSuccessful) {
-            throw OpenWrtException("操作失败 HTTP ${response.code}")
+            throw OpenWrtException("ERR_HTTP:${response.code}")
         }
     }
 
