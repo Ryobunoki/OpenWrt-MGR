@@ -3,6 +3,8 @@ name: Android Release
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
 
@@ -28,7 +30,7 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Accept Android SDK licenses
-        run: yes | sdkmanager --licenses
+        run: yes | sdkmanager --licenses >/dev/null
 
       - name: Make gradlew executable
         run: chmod +x ./gradlew
@@ -36,38 +38,42 @@ jobs:
       - name: Create debug keystore for signing
         run: |
           mkdir -p ~/.android
-          keytool -genkey -v -keystore ~/.android/debug.keystore \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -alias androiddebugkey -keypass android -storepass android \
-            -dname "CN=Android Debug,O=Android,C=US"
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkey -v -keystore ~/.android/debug.keystore \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -alias androiddebugkey -keypass android -storepass android \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
 
       - name: Build release APK
-        run: ./gradlew :app:assembleRelease
+        run: ./gradlew :app:assembleRelease --no-daemon
 
       - name: Extract app version
         run: |
-          VERSION=$(grep 'versionName' app/build.gradle | grep -oP '"\K[^"]+')
-          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          VERSION=$(grep 'versionName' app/build.gradle | head -n1 | grep -oP '"\K[^"]+')
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "App version: ${VERSION}"
 
       - name: Rename APK with version
         run: |
           cp app/build/outputs/apk/release/app-release.apk "OpenWrt-MGR-${VERSION}.apk"
-          ls -lh *.apk
+          ls -lh OpenWrt-MGR-*.apk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OpenWrt-MGR-APK
+          name: OpenWrt-MGR-${{ env.VERSION }}
           path: OpenWrt-MGR-*.apk
+          if-no-files-found: error
 
+      # Only publish a GitHub Release when pushing a version tag (v1.6.7 etc.)
       - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: OpenWrt-MGR-*.apk
           draft: false
           prerelease: false
-          tag_name: ${{ format('v{0}', env.VERSION) }}
-          name: ${{ env.VERSION }}
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
