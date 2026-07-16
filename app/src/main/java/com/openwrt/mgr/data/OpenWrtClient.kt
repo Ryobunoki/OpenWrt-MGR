@@ -2154,7 +2154,7 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         if (text.isBlank()) return emptyList()
         val list = mutableListOf<MtdPartition>()
         // mtd0: 00100000 00020000 "BL2"
-        val re = Regex("mtd(\\d+):\\s+([0-9a-fA-F]+)\\s+([0-9a-fA-F]+)\\s+\\"([^\\"]*)\\"")
+        val re = Regex("mtd(\\d+):\\s+([0-9a-fA-F]+)\\s+([0-9a-fA-F]+)\\s+\"([^\"]*)\"")
         text.lineSequence().forEach { line ->
             val m = re.find(line.trim()) ?: return@forEach
             val idx = m.groupValues[1].toIntOrNull() ?: return@forEach
