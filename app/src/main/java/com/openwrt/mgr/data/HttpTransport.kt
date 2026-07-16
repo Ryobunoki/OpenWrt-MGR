@@ -38,6 +38,25 @@ class HttpTransport(
         installTrustAll()
     }
 
+    fun getBytes(url: String, extraHeaders: Map<String, String> = emptyMap()): Pair<Int, ByteArray> {
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            doInput = true
+            instanceFollowRedirects = true
+            connectTimeout = connectTimeoutMs
+            readTimeout = readTimeoutMs
+            setRequestProperty("User-Agent", "OpenWrtMGR/1.0")
+            extraHeaders.forEach { (k, v) -> setRequestProperty(k, v) }
+        }
+        try {
+            val code = conn.responseCode
+            val stream = if (code >= 400) conn.errorStream ?: conn.inputStream else conn.inputStream
+            val bytes = stream?.use { it.readBytes() } ?: ByteArray(0)
+            return code to bytes
+        } finally {
+            conn.disconnect()
+        }
+    }
     fun postJson(url: String, json: String, extraHeaders: Map<String, String> = emptyMap()): HttpResponse {
         return post(url, json.toByteArray(Charsets.UTF_8), "application/json; charset=utf-8", extraHeaders)
     }

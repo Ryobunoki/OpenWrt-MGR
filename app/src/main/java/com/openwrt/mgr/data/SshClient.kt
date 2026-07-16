@@ -211,5 +211,96 @@ class SshClient {
             if (err !is Exception && err !is Error) return@let
         }
     }
+companion object {
+        /**
+         * One-shot non-interactive SSH command (ChannelExec).
+         * Used when ubus file.exec is ACL-denied (code=6).
+         * @return exitStatus to stdout text (UTF-8, lossy for binary)
+         */
+        fun execOnce(
+            host: String,
+            port: Int,
+            username: String,
+            password: String,
+            command: String,
+            timeoutMs: Int = 180_000
+        ): Pair<Int, String> {
+            val pureHost = host.trim()
+                .removePrefix("https://")
+                .removePrefix("http://")
+                .substringBefore('/')
+                .substringBefore(':')
+                .ifBlank { "192.168.10.1" }
+            val jsch = JSch()
+            val sess = jsch.getSession(username.ifBlank { "root" }, pureHost, port.coerceIn(1, 65535))
+            sess.setPassword(password)
+            val config = Properties()
+            config["StrictHostKeyChecking"] = "no"
+            config["PreferredAuthentications"] = "password,keyboard-interactive"
+            config["kex"] = "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,diffie-hellman-group14-sha256,diffie-hellman-group14-sha1,diffie-hellman-group1-sha1"
+            config["server_host_key"] = "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256,ssh-rsa"
+            config["cipher.s2c"] = "aes128-ctr,aes256-ctr,aes192-ctr,aes128-cbc,aes256-cbc,3des-cbc"
+            config["cipher.c2s"] = "aes128-ctr,aes256-ctr,aes192-ctr,aes128-cbc,aes256-cbc,3des-cbc"
+            config["mac.s2c"] = "hmac-sha2-256,hmac-sha2-512,hmac-sha1"
+            config["mac.c2s"] = "hmac-sha2-256,hmac-sha2-512,hmac-sha1"
+            sess.setConfig(config)
+            sess.timeout = timeoutMs.coerceIn(5_000, 600_000)
+            try {
+                sess.connect(15_000)
+                val ch = sess.openChannel("exec") as com.jcraft.jsch.ChannelExec
+                ch.setCommand(command)
+                ch.setInputStream(null)
+                val stdout = ch.inputStream
+                val stderr = ch.errStream
+                ch.connect(10_000)
+                val out = java.io.ByteArrayOutputStream()
+                val err = java.io.ByteArrayOutputStream()
+                val buf = ByteArray(8192)
+                val deadline = System.currentTimeMillis() + timeoutMs
+                while (true) {
+                    while (stdout.available() > 0) {
+                        val n = stdout.read(buf)
+                        if (n <= 0) break
+                        out.write(buf, 0, n)
+                    }
+                    while (stderr.available() > 0) {
+                        val n = stderr.read(buf)
+                        if (n <= 0) break
+                        err.write(buf, 0, n)
+                    }
+                    if (ch.isClosed) {
+                        while (stdout.available() > 0) {
+                            val n = stdout.read(buf)
+                            if (n <= 0) break
+                            out.write(buf, 0, n)
+                        }
+                        while (stderr.available() > 0) {
+                            val n = stderr.read(buf)
+                            if (n <= 0) break
+                            err.write(buf, 0, n)
+                        }
+                        break
+                    }
+                    if (System.currentTimeMillis() > deadline) {
+                        ch.disconnect()
+                        throw RuntimeException("SSH 命令超时: $command")
+                    }
+                    Thread.sleep(40)
+                }
+                val code = ch.exitStatus
+                ch.disconnect()
+                val text = buildString {
+                    append(out.toString(Charsets.UTF_8.name()))
+                    val e = err.toString(Charsets.UTF_8.name())
+                    if (e.isNotBlank()) {
+                        if (isNotEmpty()) append('\n')
+                        append(e)
+                    }
+                }
+                return code to text
+            } finally {
+                runCatching { sess.disconnect() }
+            }
+        }
+    }
 }
-

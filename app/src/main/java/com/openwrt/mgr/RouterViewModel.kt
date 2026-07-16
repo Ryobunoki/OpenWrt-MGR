@@ -312,6 +312,7 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val session = withContext(Dispatchers.IO) {
                     client.login(host, username, password, state.useHttps)
+                        .withCredentials(password, state.sshPort)
                 }
                 val remember = state.rememberPassword
                 val editor = prefs.edit()
@@ -491,7 +492,8 @@ class RouterViewModel(app: Application) : AndroidViewModel(app) {
     fun updateSshPort(port: String) {
         val p = port.filter { it.isDigit() }.toIntOrNull()?.coerceIn(1, 65535) ?: 22
         prefs.edit().putInt("sshPort", p).apply()
-        state = state.copy(sshPort = p)
+        val sess = state.session?.withCredentials(state.password, p)
+        state = state.copy(sshPort = p, session = sess ?: state.session)
     }
 
     fun updateSshCommand(value: String) {

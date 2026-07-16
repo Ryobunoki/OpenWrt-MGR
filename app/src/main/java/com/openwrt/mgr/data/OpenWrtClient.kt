@@ -13,11 +13,22 @@ data class RouterSession(
     val baseUrl: String,
     val username: String,
     /** Either "ubus:<session>" or a raw LuCI sysauth cookie value. */
-    val authToken: String
+    val authToken: String,
+    /** Kept for privileged ops when ubus file.exec is ACL-denied (code=6). */
+    val password: String = "",
+    val sshPort: Int = 22,
+    /** True after login; enables SSH fallback even when password is empty. */
+    val hasExecFallback: Boolean = false
 ) {
     val isUbus: Boolean get() = authToken.startsWith("ubus:")
     val ubusToken: String? get() = if (isUbus) authToken.removePrefix("ubus:") else null
     val luciCookie: String? get() = if (!isUbus && authToken.isNotBlank()) authToken else null
+
+    fun withCredentials(password: String, sshPort: Int): RouterSession =
+        copy(password = password, sshPort = sshPort.coerceIn(1, 65535), hasExecFallback = true)
+
+    fun hostForSsh(): String =
+        baseUrl.removePrefix("https://").removePrefix("http://").substringBefore('/').substringBefore(':')
 }
 
 data class SystemInfo(
@@ -1456,7 +1467,7 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
             }.getOrThrow()
             RouterActionResult(true, "已向 PID $p 发送 SIG${if (force) "KILL" else "TERM"}")
         } catch (e: Exception) {
-            RouterActionResult(false, e.message ?: "结束进程失败（需要 file.exec 权限）")
+            RouterActionResult(false, e.message ?: "结束进程失败。若提示 code=6，将尝试用登录密码经 SSH 执行。")
         }
     }
 
@@ -1957,6 +1968,33 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
     }
 
     private fun execCommand(session: RouterSession, command: String, params: List<String>): String {
+        val ubusErr: Exception? = try {
+            return execViaUbusFile(session, command, params)
+        } catch (e: Exception) {
+            e
+        }
+
+        // Many OpenWrt builds deny file.exec (ubus code=6). Fall back to one-shot SSH.
+        if (session.hasExecFallback) {
+            try {
+                return execViaSsh(session, command, params)
+            } catch (sshEx: Exception) {
+                throw OpenWrtException(
+                    buildString {
+                        append(friendlyExecError(ubusErr))
+                        append("；SSH 回退也失败：")
+                        append(sshEx.message ?: "unknown")
+                    }
+                )
+            }
+        }
+        throw OpenWrtException(
+            friendlyExecError(ubusErr) +
+                "。应用会用登录密码自动经 SSH 执行（kill/备份/刷机等），请确认密码正确且 SSH 端口可用（设置里可改）。也可在路由放行 ubus file.exec。"
+        )
+    }
+
+    private fun execViaUbusFile(session: RouterSession, command: String, params: List<String>): String {
         val args = JSONArray()
         params.forEach { args.put(it) }
         val result = ubusCall(
@@ -1972,6 +2010,9 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         val stdout = data.optString("stdout", "")
         val stderr = data.optString("stderr", "")
         val code = data.optInt("code", 0)
+        if (code == 6 && stdout.isBlank() && stderr.isBlank()) {
+            throw OpenWrtException("ubus 调用失败 (file.exec code=6)")
+        }
         return buildString {
             append(stdout)
             if (stderr.isNotBlank()) {
@@ -1982,6 +2023,45 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         }
     }
 
+    private fun execViaSsh(session: RouterSession, command: String, params: List<String>): String {
+        val host = session.hostForSsh()
+        val cmd = buildShellCommand(command, params)
+        val (code, out) = SshClient.execOnce(
+            host = host,
+            port = session.sshPort,
+            username = session.username.ifBlank { "root" },
+            password = session.password,
+            command = cmd
+        )
+        if (code != 0 && out.isBlank()) {
+            throw OpenWrtException("SSH 命令失败 code=$code: $cmd")
+        }
+        return out
+    }
+
+    private fun buildShellCommand(command: String, params: List<String>): String {
+        if (params.isEmpty()) return command
+        return buildString {
+            append(command)
+            params.forEach { p ->
+                append(' ')
+                append(shellQuote(p))
+            }
+        }
+    }
+
+    private fun shellQuote(s: String): String {
+        return "'" + s.replace("'", "'\"'\"'") + "'"
+    }
+
+    private fun friendlyExecError(e: Exception?): String {
+        val msg = e?.message.orEmpty()
+        return when {
+            msg.contains("code=6") -> "路由器 ACL 禁止 ubus file.exec（code=6）"
+            msg.isNotBlank() -> msg
+            else -> "无法执行命令"
+        }
+    }
 
     fun fetchStorage(session: RouterSession): List<StorageVolume> {
         // Merge multiple sources: many builds deny file.exec (df) and/or lack luci.getMountPoints.
@@ -2173,20 +2253,48 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
     }
 
     fun createConfigBackup(session: RouterSession): BinaryActionResult {
+        // 1) LuCI cgi-backup — no file.exec required
+        runCatching { downloadCgiBackup(session) }.getOrNull()?.let { bytes ->
+            if (bytes.isNotEmpty()) {
+                return BinaryActionResult(
+                    true,
+                    "备份已生成（${bytes.size} 字节），请选择保存位置",
+                    bytes,
+                    "openwrt-backup.tar.gz"
+                )
+            }
+        }
+
         return try {
             val path = "/tmp/openwrt-backup-${System.currentTimeMillis()}.tar.gz"
             val out = runCatching {
                 execCommand(session, "/sbin/sysupgrade", listOf("-b", path))
-            }.getOrElse {
+            }.recoverCatching {
                 execCommand(session, "/usr/bin/sysupgrade", listOf("-b", path))
+            }.recoverCatching {
+                execCommand(
+                    session,
+                    "/bin/sh",
+                    listOf("-c", "tar czf $path -C / etc overlay/etc 2>/dev/null || tar czf $path -C / etc")
+                )
+            }.getOrElse { throw it }
+
+            var bytes = runCatching { fileReadBytes(session, path) }.getOrNull()
+            if ((bytes == null || bytes.isEmpty()) && session.hasExecFallback) {
+                val b64 = runCatching {
+                    execViaSsh(session, "/bin/sh", listOf("-c", "base64 '$path' 2>/dev/null"))
+                }.getOrDefault("")
+                if (b64.isNotBlank()) {
+                    bytes = runCatching {
+                        Base64.decode(b64.replace(Regex("\\s"), ""), Base64.DEFAULT)
+                    }.getOrNull()
+                }
             }
-            // verify file exists via stat/read
-            val bytes = runCatching { fileReadBytes(session, path) }.getOrNull()
             runCatching { execCommand(session, "/bin/rm", listOf("-f", path)) }
             if (bytes == null || bytes.isEmpty()) {
                 BinaryActionResult(
                     false,
-                    "生成备份失败（需要 sysupgrade 与 file.read 权限）。$out".trim()
+                    "生成备份失败（需要 sysupgrade/file.read 或 SSH）。$out".trim()
                 )
             } else {
                 BinaryActionResult(
@@ -2199,6 +2307,26 @@ fun listPlugins(session: RouterSession): List<PluginInfo> {
         } catch (e: Exception) {
             BinaryActionResult(false, e.message ?: "生成备份失败")
         }
+    }
+
+    private fun downloadCgiBackup(session: RouterSession): ByteArray? {
+        val headers = linkedMapOf<String, String>()
+        val ck = session.luciCookie
+        if (!ck.isNullOrBlank()) {
+            headers["Cookie"] = "sysauth=$ck; sysauth_http=$ck; sysauth_https=$ck"
+        }
+        val urls = listOf(
+            "${session.baseUrl}/cgi-bin/cgi-backup",
+            "${session.baseUrl}/cgi-bin/luci/admin/system/flashops/backup",
+            "${session.baseUrl}/cgi-bin/luci/admin/system/flash/backup"
+        )
+        for (url in urls) {
+            val pair = runCatching { http.getBytes(url, headers) }.getOrNull() ?: continue
+            val code = pair.first
+            val bytes = pair.second
+            if (code in 200..299 && bytes.size > 64) return bytes
+        }
+        return null
     }
 
     fun factoryReset(session: RouterSession): RouterActionResult {
