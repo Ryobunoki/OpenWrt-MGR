@@ -44,12 +44,19 @@ data class NetworkDevice(
 )
 
 data class WirelessInterface(
+    val radio: String = "",
     val ifname: String,
     val ssid: String,
     val mode: String,
     val channel: String,
+    val frequency: String = "-",
     val signal: String,
-    val bitrate: String
+    val noise: String = "-",
+    val bitrate: String,
+    val bssid: String = "-",
+    val encryption: String = "-",
+    val hardware: String = "-",
+    val up: Boolean = true
 )
 
 data class PluginInfo(
@@ -390,6 +397,9 @@ class OpenWrtClient(
         while (radios.hasNext()) {
             val radio = radios.next()
             val radioObj = data.optJSONObject(radio) ?: continue
+            val radioConfig = radioObj.optJSONObject("config") ?: JSONObject()
+            val radioIwinfo = radioObj.optJSONObject("iwinfo") ?: JSONObject()
+            val radioUp = radioObj.optBoolean("up", true)
             val interfaces = radioObj.optJSONObject("interfaces") ?: continue
             val ifKeys = interfaces.keys()
             while (ifKeys.hasNext()) {
@@ -397,19 +407,166 @@ class OpenWrtClient(
                 val iface = interfaces.optJSONObject(key) ?: continue
                 val config = iface.optJSONObject("config") ?: JSONObject()
                 val iwinfo = iface.optJSONObject("iwinfo") ?: JSONObject()
+                val hwName = iwinfo.optJSONObject("hardware")?.optString("name")
+                    ?.takeIf { it.isNotBlank() }
+                    ?: radioIwinfo.optJSONObject("hardware")?.optString("name")
+                    ?.takeIf { it.isNotBlank() }
+                    ?: "-"
+                val hwmodes = formatHwModes(
+                    iwinfo.optJSONArray("hwmodes")
+                        ?: radioIwinfo.optJSONArray("hwmodes")
+                        ?: iwinfo.optJSONArray("hwmodeslist")
+                )
+                val hardware = when {
+                    hwName != "-" && hwmodes.isNotBlank() -> "$hwName $hwmodes"
+                    hwName != "-" -> hwName
+                    else -> hwmodes.ifBlank { "-" }
+                }
+                val channel = iwinfo.opt("channel")?.toString()
+                    ?: config.opt("channel")?.toString()
+                    ?: radioConfig.opt("channel")?.toString()
+                    ?: "-"
+                val frequency = formatFrequency(iwinfo.opt("frequency") ?: radioIwinfo.opt("frequency"))
+                val signalRaw = iwinfo.opt("signal")
+                val noiseRaw = iwinfo.opt("noise")
+                val signal = when {
+                    signalRaw == null || signalRaw.toString().isBlank() || signalRaw.toString() == "null" -> "---"
+                    else -> signalRaw.toString()
+                }
+                val noise = when {
+                    noiseRaw == null || noiseRaw.toString().isBlank() || noiseRaw.toString() == "null" -> "---"
+                    else -> noiseRaw.toString()
+                }
+                val modeIw = iwinfo.optString("mode", "")
+                val modeCfg = config.optString("mode", "")
+                val mode = when {
+                    modeIw.isNotBlank() -> modeIw
+                    modeCfg.equals("ap", true) -> "Master"
+                    modeCfg.equals("sta", true) -> "Client"
+                    modeCfg.isNotBlank() -> modeCfg
+                    else -> "-"
+                }
                 list += WirelessInterface(
-                    ifname = iwinfo.optString("ifname", key),
-                    ssid = config.optString("ssid", iwinfo.optString("ssid", "-")),
-                    mode = config.optString("mode", iwinfo.optString("mode", "-")),
-                    channel = iwinfo.opt("channel")?.toString()
-                        ?: config.opt("channel")?.toString()
-                        ?: "-",
-                    signal = iwinfo.opt("signal")?.toString() ?: "-",
-                    bitrate = iwinfo.opt("bitrate")?.toString() ?: "-"
+                    radio = radio,
+                    ifname = iwinfo.optString(
+                        "ifname",
+                        iface.optString("ifname", config.optString("ifname", key))
+                    ),
+                    ssid = config.optString("ssid", iwinfo.optString("ssid", "-")).ifBlank { "-" },
+                    mode = mode,
+                    channel = channel,
+                    frequency = frequency,
+                    signal = signal,
+                    noise = noise,
+                    bitrate = formatBitrate(iwinfo.opt("bitrate")),
+                    bssid = iwinfo.optString("bssid", iwinfo.optString("BSSID", "-")).ifBlank { "-" },
+                    encryption = formatEncryption(
+                        iwinfo.optJSONObject("encryption"),
+                        config.optString("encryption", "")
+                    ),
+                    hardware = hardware,
+                    up = radioUp && !config.optBoolean("disabled", false)
                 )
             }
         }
-        return list
+        return list.sortedWith(compareBy({ it.radio }, { it.ifname }, { it.ssid }))
+    }
+
+    private fun formatFrequency(raw: Any?): String {
+        if (raw == null) return "-"
+        val n = when (raw) {
+            is Number -> raw.toDouble()
+            else -> raw.toString().toDoubleOrNull() ?: return raw.toString()
+        }
+        if (n <= 0) return "-"
+        // iwinfo frequency is MHz (e.g. 2437 / 5320)
+        val ghz = if (n > 1000) n / 1000.0 else n
+        return String.format("%.3f GHz", ghz)
+    }
+
+    private fun formatBitrate(raw: Any?): String {
+        if (raw == null) return "? Mbit/s"
+        val n = when (raw) {
+            is Number -> raw.toDouble()
+            else -> raw.toString().toDoubleOrNull()
+        } ?: return raw.toString()
+        if (n <= 0) return "? Mbit/s"
+        // iwinfo bitrate is usually kbit/s
+        val mbit = if (n >= 1000) n / 1000.0 else n
+        return if (mbit >= 100) "${mbit.toInt()} Mbit/s"
+        else String.format("%.1f Mbit/s", mbit)
+    }
+
+    private fun formatHwModes(arr: org.json.JSONArray?): String {
+        if (arr == null || arr.length() == 0) return ""
+        val modes = mutableListOf<String>()
+        for (i in 0 until arr.length()) {
+            val m = arr.optString(i).trim().lowercase()
+            if (m.isNotBlank()) modes += m
+        }
+        if (modes.isEmpty()) return ""
+        // Prefer 802.11ax/ac style label
+        return "802.11" + modes.distinct().joinToString("/")
+    }
+
+    private fun formatEncryption(encObj: JSONObject?, configEnc: String): String {
+        if (encObj != null && encObj.length() > 0) {
+            if (!encObj.optBoolean("enabled", true) && configEnc in listOf("", "none")) {
+                return "None"
+            }
+            val wpa = encObj.optJSONArray("wpa")
+            val wpaVer = buildList {
+                if (wpa != null) for (i in 0 until wpa.length()) add(wpa.optInt(i))
+            }.filter { it > 0 }.distinct().sorted()
+            val authArr = encObj.optJSONArray("authentication")
+            val auth = buildList {
+                if (authArr != null) for (i in 0 until authArr.length()) {
+                    val a = authArr.optString(i).lowercase()
+                    if (a.isNotBlank()) add(a)
+                }
+            }
+            val cipherArr = encObj.optJSONArray("ciphers")
+            val ciphers = buildList {
+                if (cipherArr != null) for (i in 0 until cipherArr.length()) {
+                    val c = cipherArr.optString(i).uppercase()
+                    if (c.isNotBlank()) add(c)
+                }
+            }
+            val wpaLabel = when {
+                wpaVer == listOf(3) -> "WPA3"
+                wpaVer == listOf(2, 3) || wpaVer == listOf(3, 2) -> "WPA2/WPA3"
+                wpaVer == listOf(2) -> "WPA2"
+                wpaVer == listOf(1, 2) -> "WPA/WPA2"
+                wpaVer == listOf(1) -> "WPA"
+                wpaVer.isNotEmpty() -> "WPA" + wpaVer.joinToString("/")
+                else -> ""
+            }
+            val authLabel = when {
+                auth.any { it.contains("sae") } && auth.any { it.contains("psk") } -> "SAE/PSK"
+                auth.any { it.contains("sae") } -> "SAE"
+                auth.any { it.contains("psk") } -> "PSK"
+                auth.any { it.contains("eap") } -> "EAP"
+                auth.isNotEmpty() -> auth.joinToString("/").uppercase()
+                else -> ""
+            }
+            val cipherLabel = ciphers.distinct().joinToString("/")
+            val parts = listOf(wpaLabel, authLabel).filter { it.isNotBlank() }
+            val head = parts.joinToString(" ").ifBlank {
+                if (configEnc.isNotBlank() && configEnc != "none") configEnc.uppercase() else "Open"
+            }
+            return if (cipherLabel.isNotBlank()) "$head ($cipherLabel)" else head
+        }
+        return when (configEnc.lowercase()) {
+            "", "none" -> "None"
+            "psk2", "psk2+ccmp" -> "WPA2 PSK (CCMP)"
+            "psk2+tkip" -> "WPA2 PSK (TKIP)"
+            "psk-mixed", "psk-mixed+ccmp" -> "WPA/WPA2 PSK"
+            "sae" -> "WPA3 SAE"
+            "sae-mixed" -> "WPA2/WPA3"
+            "psk" -> "WPA PSK"
+            "wpa2", "wpa2+ccmp" -> "WPA2"
+            else -> configEnc.ifBlank { "-" }
+        }
     }
 
     fun listPlugins(session: RouterSession): List<PluginInfo> {

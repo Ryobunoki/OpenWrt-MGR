@@ -15,6 +15,9 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.text.style.LineHeightStyle
+import androidx.compose.ui.text.PlatformTextStyle
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -1312,11 +1315,76 @@ private fun OverviewTab(state: UiState) {
             }
         }
         item {
+            InfoCard(l10n.wirelessOverview) {
+                if (state.wireless.isEmpty()) {
+                    Text(l10n.noWireless, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                } else {
+                    state.wireless.forEachIndexed { idx, w ->
+                        if (idx > 0) Spacer(Modifier.height(12.dp))
+                        val title = buildString {
+                            if (w.radio.isNotBlank()) append(w.radio)
+                            if (w.ifname.isNotBlank() && w.ifname != w.radio) {
+                                if (isNotEmpty()) append(" · ")
+                                append(w.ifname)
+                            }
+                            if (isEmpty()) append(w.ssid.ifBlank { "-" })
+                        }
+                        Text(title, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                        if (w.hardware.isNotBlank() && w.hardware != "-") {
+                            Text(
+                                w.hardware,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        val chFreq = buildString {
+                            append(l10n.channel)
+                            append(": ")
+                            append(w.channel.ifBlank { "-" })
+                            if (w.frequency.isNotBlank() && w.frequency != "-") {
+                                append(" (")
+                                append(w.frequency)
+                                append(")")
+                            }
+                            append("  |  ")
+                            append(l10n.rate)
+                            append(": ")
+                            append(w.bitrate.ifBlank { "?" })
+                        }
+                        Text(
+                            chFreq,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        KeyValue("SSID", w.ssid.ifBlank { "-" })
+                        KeyValue(l10n.mode, w.mode.ifBlank { "-" })
+                        KeyValue("BSSID", w.bssid.ifBlank { "-" })
+                        KeyValue(l10n.encryption, w.encryption.ifBlank { "-" })
+                        val sn = buildString {
+                            append(w.signal.ifBlank { "---" })
+                            append("/")
+                            append(w.noise.ifBlank { "---" })
+                            if (!endsWith("dBm") && w.signal.any { it.isDigit() }) append(" dBm")
+                        }
+                        KeyValue(l10n.signal, sn)
+                        if (!w.up) {
+                            Text(
+                                l10n.disabled,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        item {
             InfoCard(l10n.summary) {
                 KeyValue(l10n.onlineDevices, "${state.devices.size}")
                 KeyValue(l10n.installedPlugins, "${state.plugins.count { it.installed }}")
                 KeyValue(l10n.storageVolumes, "${state.storageVolumes.size}")
                 KeyValue(l10n.networkIfaces, "${state.networkIfaces.size}")
+                KeyValue(l10n.wirelessOverview, "${state.wireless.size}")
             }
         }
     }
@@ -1343,10 +1411,38 @@ private fun WifiTab(state: UiState) {
 
     if (state.wireless.isEmpty()) { EmptyState(l10n.noWireless); return }
     LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        items(state.wireless, key = { it.ifname + it.ssid }) { w ->
+        items(state.wireless, key = { it.radio + it.ifname + it.ssid + it.bssid }) { w ->
             GlassCard {
-                Text(w.ssid.ifBlank { w.ifname }, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-                KeyValue(l10n.iface, w.ifname); KeyValue(l10n.mode, w.mode); KeyValue(l10n.channel, w.channel); KeyValue(l10n.signal, w.signal); KeyValue(l10n.rate, w.bitrate)
+                val head = listOf(w.radio, w.ssid.ifBlank { w.ifname }).filter { it.isNotBlank() }.joinToString(" · ")
+                Text(head, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                if (w.hardware.isNotBlank() && w.hardware != "-") {
+                    Text(
+                        w.hardware,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                KeyValue(l10n.iface, w.ifname.ifBlank { "-" })
+                KeyValue(l10n.mode, w.mode.ifBlank { "-" })
+                KeyValue(
+                    l10n.channel,
+                    buildString {
+                        append(w.channel.ifBlank { "-" })
+                        if (w.frequency.isNotBlank() && w.frequency != "-") append(" (").append(w.frequency).append(")")
+                    }
+                )
+                KeyValue(l10n.rate, w.bitrate.ifBlank { "?" })
+                KeyValue(
+                    l10n.signal,
+                    buildString {
+                        append(w.signal.ifBlank { "---" })
+                        append("/")
+                        append(w.noise.ifBlank { "---" })
+                        if (w.signal.any { it.isDigit() }) append(" dBm")
+                    }
+                )
+                KeyValue("BSSID", w.bssid.ifBlank { "-" })
+                KeyValue(l10n.encryption, w.encryption.ifBlank { "-" })
             }
         }
     }
@@ -1531,6 +1627,7 @@ private fun SshTab(
                 .weight(1f)
                 .fillMaxWidth()
                 .padding(horizontal = 6.dp)
+                .clipToBounds()
                 .clickable(
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() }
@@ -1546,7 +1643,7 @@ private fun SshTab(
                         (size.width.toDp().value / (fontSp * 0.60f)).toInt().coerceIn(40, 240)
                     }
                     val rows = with(density) {
-                        (size.height.toDp().value / (fontSp * 1.30f)).toInt().coerceIn(8, 80)
+                        (size.height.toDp().value / (fontSp * 1.10f)).toInt().coerceIn(8, 80)
                     }
                     if (cols != pendingCols || rows != pendingRows) {
                         pendingCols = cols
@@ -1565,11 +1662,17 @@ private fun SshTab(
                 } else {
                     annotated
                 },
-                modifier = mod,
+                modifier = mod.clipToBounds(),
                 style = TextStyle(
                     fontFamily = TerminalFontFamily,
                     fontSize = fontSp.sp,
-                    lineHeight = (fontSp * 1.30f).sp,
+                    // Tight line box so SpanStyle backgrounds do not stick out as grey bars
+                    lineHeight = (fontSp * 1.10f).sp,
+                    lineHeightStyle = LineHeightStyle(
+                        alignment = LineHeightStyle.Alignment.Center,
+                        trim = LineHeightStyle.Trim.Both
+                    ),
+                    platformStyle = PlatformTextStyle(includeFontPadding = false),
                     color = termFg
                 ),
                 softWrap = softWrap

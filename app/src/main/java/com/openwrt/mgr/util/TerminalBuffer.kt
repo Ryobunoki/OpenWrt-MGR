@@ -334,7 +334,13 @@ class TerminalBuffer(private val maxChars: Int = 120_000) {
         val sb = lines[row]
         val vis = visibleLength(sb)
         if (col > vis) {
-            repeat(col - vis) { sb.append(' ') }
+            // Reset background before padding so cursor jumps do not paint a long
+            // ghost rectangle with the previous powerline segment color.
+            val pad = col - vis
+            if (pad >= 2) {
+                sb.append(ESC).append("[49m")
+            }
+            repeat(pad) { sb.append(' ') }
         }
     }
 

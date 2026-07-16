@@ -244,24 +244,61 @@ object AnsiStrip {
                 val next = text.indexOf('\u001B', i).let { if (it < 0) text.length else it }
                 val chunk = text.substring(i, next)
                 if (chunk.isNotEmpty()) {
-                    val fg = when {
-                        state.fg != null && state.dim -> state.fg!!.copy(alpha = 0.78f)
-                        state.fg != null -> state.fg!!
-                        state.dim -> defaultColor.copy(alpha = 0.78f)
-                        else -> defaultColor
-                    }
-                    withStyle(
-                        SpanStyle(
-                            color = fg,
-                            background = state.bg ?: Color.Unspecified,
-                            fontWeight = if (state.bold) FontWeight.Bold else FontWeight.Normal,
-                            fontStyle = if (state.italic) FontStyle.Italic else FontStyle.Normal
-                        )
-                    ) {
-                        append(chunk)
-                    }
+                    // Never paint background on newlines — Compose draws a full-width
+                    // rectangle for "\n" spans which looks like a protruding grey bar.
+                    appendStyledRuns(chunk, state, defaultColor)
                 }
                 i = next
+            }
+        }
+    }
+
+    private fun AnnotatedString.Builder.appendStyledRuns(
+        chunk: String,
+        state: StyleState,
+        defaultColor: Color
+    ) {
+        var start = 0
+        while (start < chunk.length) {
+            val nl = chunk.indexOf('\n', start)
+            val end = if (nl < 0) chunk.length else nl
+            if (end > start) {
+                val run = chunk.substring(start, end)
+                // Drop trailing spaces that only carry a background: they often expand
+                // into a long rectangle after wrap/clear. Keep at most one space for
+                // powerline padding between segments (handled by segment SGR itself).
+                val paint = run
+                val fg = when {
+                    state.fg != null && state.dim -> state.fg!!.copy(alpha = 0.78f)
+                    state.fg != null -> state.fg!!
+                    state.dim -> defaultColor.copy(alpha = 0.78f)
+                    else -> defaultColor
+                }
+                // Powerline uses bg on printable cells; keep opaque bg for those.
+                // Skip bg when the whole run is only spaces AND very long (ghost bars).
+                val bg = state.bg
+                val useBg = when {
+                    bg == null -> false
+                    paint.isNotEmpty() && paint.all { it == ' ' } && paint.length >= 8 -> false
+                    else -> bg != null
+                }
+                withStyle(
+                    SpanStyle(
+                        color = fg,
+                        background = if (useBg) bg!! else Color.Unspecified,
+                        fontWeight = if (state.bold) FontWeight.Bold else FontWeight.Normal,
+                        fontStyle = if (state.italic) FontStyle.Italic else FontStyle.Normal
+                    )
+                ) {
+                    append(paint)
+                }
+            }
+            if (nl >= 0) {
+                // Plain newline — no SpanStyle background
+                append('\n')
+                start = nl + 1
+            } else {
+                break
             }
         }
     }

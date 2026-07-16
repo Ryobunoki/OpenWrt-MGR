@@ -141,6 +141,9 @@ class L10n internal constructor(private val map: Map<String, String>) {
     val channel: String get() = t("channel")
     val signal: String get() = t("signal")
     val rate: String get() = t("rate")
+    val wirelessOverview: String get() = t("wireless_overview")
+    val encryption: String get() = t("encryption")
+    val disabled: String get() = t("disabled")
     val connecting: String get() = t("connecting")
     val notConnected: String get() = t("not_connected")
     val zoomOut: String get() = t("zoom_out")
@@ -376,6 +379,9 @@ private val FALLBACK: Map<String, String> = mapOf(
     "channel" to "信道",
     "signal" to "信号",
     "rate" to "速率",
+    "wireless_overview" to "无线概况",
+    "encryption" to "加密",
+    "disabled" to "已禁用",
     "connecting" to "连接中…",
     "not_connected" to "未连接",
     "zoom_out" to "缩小",
@@ -612,6 +618,9 @@ private val PACKS: Map<String, Map<String, String>> = mapOf(
         "channel" to "信道",
         "signal" to "信号",
         "rate" to "速率",
+        "wireless_overview" to "无线概况",
+        "encryption" to "加密",
+        "disabled" to "已禁用",
         "connecting" to "连接中…",
         "not_connected" to "未连接",
         "zoom_out" to "缩小",
@@ -846,6 +855,9 @@ private val PACKS: Map<String, Map<String, String>> = mapOf(
         "channel" to "頻道",
         "signal" to "訊號",
         "rate" to "速率",
+        "wireless_overview" to "無線概況",
+        "encryption" to "加密",
+        "disabled" to "已停用",
         "connecting" to "連線中…",
         "not_connected" to "未連線",
         "zoom_out" to "縮小",
@@ -1080,6 +1092,9 @@ private val PACKS: Map<String, Map<String, String>> = mapOf(
         "channel" to "Channel",
         "signal" to "Signal",
         "rate" to "Rate",
+        "wireless_overview" to "Wireless overview",
+        "encryption" to "Encryption",
+        "disabled" to "Disabled",
         "connecting" to "Connecting…",
         "not_connected" to "Not connected",
         "zoom_out" to "Zoom out",
@@ -1314,6 +1329,9 @@ private val PACKS: Map<String, Map<String, String>> = mapOf(
         "channel" to "チャネル",
         "signal" to "信号",
         "rate" to "速度",
+        "wireless_overview" to "無線概要",
+        "encryption" to "暗号化",
+        "disabled" to "無効",
         "connecting" to "接続中…",
         "not_connected" to "未接続",
         "zoom_out" to "縮小",
@@ -1548,6 +1566,9 @@ private val PACKS: Map<String, Map<String, String>> = mapOf(
         "channel" to "Канал",
         "signal" to "Сигнал",
         "rate" to "Скорость",
+        "wireless_overview" to "Обзор Wi-Fi",
+        "encryption" to "Шифрование",
+        "disabled" to "Отключено",
         "connecting" to "Подключение…",
         "not_connected" to "Не подключено",
         "zoom_out" to "Мельче",
@@ -1782,6 +1803,9 @@ private val PACKS: Map<String, Map<String, String>> = mapOf(
         "channel" to "채널",
         "signal" to "신호",
         "rate" to "속도",
+        "wireless_overview" to "무선 개요",
+        "encryption" to "암호화",
+        "disabled" to "비활성",
         "connecting" to "연결 중…",
         "not_connected" to "연결 안 됨",
         "zoom_out" to "축소",
