@@ -43,15 +43,20 @@ class TerminalBuffer(private val maxChars: Int = 120_000) {
                     i += consumed
                 }
                 ch == '\r' -> {
+                    // CR alone: in-place redraw (oh-my-posh / readline). Clear the line so
+                    // leftover glyphs/SGR from a longer previous prompt cannot stick around.
+                    // CR+LF is a line ending — keep content, only reset column.
                     col = 0
                     i++
+                    if (i >= src.length || src[i] != '\n') {
+                        lines[row] = StringBuilder()
+                    }
                 }
                 ch == '\n' -> {
                     newLine()
                     i++
                 }
                 ch == BS -> {
-                    // BS moves cursor left only; erase is typically BS SPACE BS
                     col = (col - 1).coerceAtLeast(0)
                     i++
                 }
@@ -70,8 +75,14 @@ class TerminalBuffer(private val maxChars: Int = 120_000) {
                 ch == BEL -> i++
                 ch.code < 32 -> i++
                 else -> {
-                    putPrintable(ch)
-                    i++
+                    // Keep UTF-16 surrogate pairs together as one cell
+                    if (ch.isHighSurrogate() && i + 1 < src.length && src[i + 1].isLowSurrogate()) {
+                        putPrintablePair(ch, src[i + 1])
+                        i += 2
+                    } else {
+                        putPrintable(ch)
+                        i++
+                    }
                 }
             }
         }
@@ -169,7 +180,7 @@ class TerminalBuffer(private val maxChars: Int = 120_000) {
                 1 -> eraseLineToStart()
                 2 -> {
                     lines[row] = StringBuilder()
-                    // keep col; many apps reset separately
+                    col = col.coerceAtMost(0)
                 }
             }
             'P' -> deleteChars(p(0))
@@ -190,11 +201,32 @@ class TerminalBuffer(private val maxChars: Int = 120_000) {
         val idx = indexOfVisibleCol(sb, col)
         if (idx >= sb.length) {
             sb.append(ch)
-        } else if (isSgrStart(sb, idx)) {
-            val after = skipSgr(sb, idx)
-            if (after >= sb.length) sb.append(ch) else sb.setCharAt(after, ch)
         } else {
-            sb.setCharAt(idx, ch)
+            // Replace one visible cell; if it was a surrogate pair, remove both code units
+            val end = if (sb[idx].isHighSurrogate() && idx + 1 < sb.length && sb[idx + 1].isLowSurrogate()) {
+                idx + 2
+            } else {
+                idx + 1
+            }
+            sb.replace(idx, end, ch.toString())
+        }
+        col++
+    }
+
+    private fun putPrintablePair(hi: Char, lo: Char) {
+        ensureCol()
+        val sb = lines[row]
+        val idx = indexOfVisibleCol(sb, col)
+        val pair = charArrayOf(hi, lo).concatToString()
+        if (idx >= sb.length) {
+            sb.append(pair)
+        } else {
+            val end = if (sb[idx].isHighSurrogate() && idx + 1 < sb.length && sb[idx + 1].isLowSurrogate()) {
+                idx + 2
+            } else {
+                idx + 1
+            }
+            sb.replace(idx, end, pair)
         }
         col++
     }
@@ -209,9 +241,19 @@ class TerminalBuffer(private val maxChars: Int = 120_000) {
             if (isSgrStart(sb, idx)) {
                 val after = skipSgr(sb, idx)
                 if (after >= sb.length) break
-                sb.deleteCharAt(after)
+                val end = if (sb[after].isHighSurrogate() && after + 1 < sb.length && sb[after + 1].isLowSurrogate()) {
+                    after + 2
+                } else {
+                    after + 1
+                }
+                sb.delete(after, end)
             } else {
-                sb.deleteCharAt(idx)
+                val end = if (sb[idx].isHighSurrogate() && idx + 1 < sb.length && sb[idx + 1].isLowSurrogate()) {
+                    idx + 2
+                } else {
+                    idx + 1
+                }
+                sb.delete(idx, end)
             }
             removed++
         }
@@ -225,11 +267,13 @@ class TerminalBuffer(private val maxChars: Int = 120_000) {
             val idx = indexOfVisibleCol(sb, col)
             if (idx >= sb.length) {
                 sb.append(' ')
-            } else if (isSgrStart(sb, idx)) {
-                val after = skipSgr(sb, idx)
-                if (after >= sb.length) sb.append(' ') else sb.setCharAt(after, ' ')
             } else {
-                sb.setCharAt(idx, ' ')
+                val end = if (sb[idx].isHighSurrogate() && idx + 1 < sb.length && sb[idx + 1].isLowSurrogate()) {
+                    idx + 2
+                } else {
+                    idx + 1
+                }
+                sb.replace(idx, end, " ")
             }
             col++
         }
@@ -254,6 +298,7 @@ class TerminalBuffer(private val maxChars: Int = 120_000) {
         val tail = sb.substring(idx)
         val prefixSgr = extractLeadingSgr(sb, idx)
         lines[row] = StringBuilder(prefixSgr).append(tail)
+        // Cursor stays; leading printable cells are gone — keep col as-is per VT (rare path)
     }
 
     private fun extractLeadingSgr(sb: StringBuilder, before: Int): String {
@@ -297,9 +342,16 @@ class TerminalBuffer(private val maxChars: Int = 120_000) {
         var n = 0
         var i = 0
         while (i < sb.length) {
-            if (isSgrStart(sb, i)) i = skipSgr(sb, i) else {
-                n++
-                i++
+            when {
+                isSgrStart(sb, i) -> i = skipSgr(sb, i)
+                sb[i].isHighSurrogate() && i + 1 < sb.length && sb[i + 1].isLowSurrogate() -> {
+                    n++
+                    i += 2
+                }
+                else -> {
+                    n++
+                    i++
+                }
             }
         }
         return n
@@ -309,12 +361,18 @@ class TerminalBuffer(private val maxChars: Int = 120_000) {
         var n = 0
         var i = 0
         while (i < sb.length) {
-            if (isSgrStart(sb, i)) {
-                i = skipSgr(sb, i)
-            } else {
-                if (n == targetCol) return i
-                n++
-                i++
+            when {
+                isSgrStart(sb, i) -> i = skipSgr(sb, i)
+                sb[i].isHighSurrogate() && i + 1 < sb.length && sb[i + 1].isLowSurrogate() -> {
+                    if (n == targetCol) return i
+                    n++
+                    i += 2
+                }
+                else -> {
+                    if (n == targetCol) return i
+                    n++
+                    i++
+                }
             }
         }
         return sb.length

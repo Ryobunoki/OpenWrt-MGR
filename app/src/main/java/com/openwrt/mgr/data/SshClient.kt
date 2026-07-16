@@ -20,6 +20,8 @@ class SshClient {
     private var stdin: OutputStream? = null
     private var readerThread: Thread? = null
     private val connected = AtomicBoolean(false)
+    /** Incomplete UTF-8 sequence held across socket reads (prevents intermittent mojibake). */
+    private var utf8Carry: ByteArray = ByteArray(0)
 
     @Volatile
     private var outputListener: ((String) -> Unit)? = null
@@ -84,6 +86,7 @@ class SshClient {
             connected.set(true)
             statusListener?.invoke(true, null)
 
+            utf8Carry = ByteArray(0)
             readerThread = Thread({
                 val buf = ByteArray(16384)
                 try {
@@ -91,8 +94,8 @@ class SshClient {
                         val n = input.read(buf)
                         if (n < 0) break
                         if (n > 0) {
-                            val text = String(buf, 0, n, Charsets.UTF_8)
-                            outputListener?.invoke(text)
+                            val text = takeUtf8(buf, n)
+                            if (text.isNotEmpty()) outputListener?.invoke(text)
                         }
                     }
                 } catch (_: Exception) {
@@ -141,7 +144,53 @@ class SshClient {
         statusListener?.invoke(false, null)
     }
 
+
+    /**
+     * Decode as much complete UTF-8 as possible; stash trailing partial sequence.
+     * Avoids mojibake when multi-byte glyphs (nerd/powerline) split across TCP reads.
+     */
+    @Synchronized
+    private fun takeUtf8(buf: ByteArray, n: Int): String {
+        val data = if (utf8Carry.isEmpty()) {
+            buf.copyOf(n)
+        } else {
+            ByteArray(utf8Carry.size + n).also {
+                System.arraycopy(utf8Carry, 0, it, 0, utf8Carry.size)
+                System.arraycopy(buf, 0, it, utf8Carry.size, n)
+            }
+        }
+        if (data.isEmpty()) return ""
+        val cut = completeUtf8Length(data)
+        if (cut <= 0) {
+            utf8Carry = data
+            return ""
+        }
+        utf8Carry = if (cut < data.size) data.copyOfRange(cut, data.size) else ByteArray(0)
+        return String(data, 0, cut, Charsets.UTF_8)
+    }
+
+    private fun completeUtf8Length(data: ByteArray): Int {
+        var i = data.size
+        // Walk back over continuation bytes (10xxxxxx)
+        var cont = 0
+        while (i > 0 && cont < 3 && (data[i - 1].toInt() and 0xC0) == 0x80) {
+            i--
+            cont++
+        }
+        if (i == 0) return 0
+        val lead = data[i - 1].toInt() and 0xFF
+        val need = when {
+            lead and 0x80 == 0 -> 1
+            lead and 0xE0 == 0xC0 -> 2
+            lead and 0xF0 == 0xE0 -> 3
+            lead and 0xF8 == 0xF0 -> 4
+            else -> 1
+        }
+        val have = data.size - (i - 1)
+        return if (have < need) i - 1 else data.size
+    }
     private fun disconnectQuiet() {
+        utf8Carry = ByteArray(0)
         // Snapshot then null fields first so the JSch session thread / reader
         // cannot race a second disconnect path with half-torn state.
         val ch = channel

@@ -16,6 +16,10 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.foundation.text.BasicTextField
 import android.graphics.BitmapFactory
@@ -1387,6 +1391,13 @@ private fun SshTab(
             lastRows = 0
             pendingCols = 0
             pendingRows = 0
+        } else {
+            // Bind IME action key before the first Enter press
+            delay(120)
+            runCatching {
+                focusRequester.requestFocus()
+                keyboard?.show()
+            }
         }
     }
     LaunchedEffect(pendingCols, pendingRows, state.sshConnected) {
@@ -1601,21 +1612,54 @@ private fun SshTab(
                     }
                 },
                 modifier = Modifier
-                    .size(1.dp)
+                    .fillMaxWidth()
+                    .height(1.dp)
                     .align(Alignment.BottomStart)
                     .focusRequester(focusRequester)
-                    .alpha(0.01f),
+                    .alpha(0.02f)
+                    .onPreviewKeyEvent { e ->
+                        if (e.type == KeyEventType.KeyDown &&
+                            (e.key == Key.Enter || e.key == Key.NumPadEnter)
+                        ) {
+                            if (state.sshConnected) {
+                                onRawSend("\r")
+                                draft = ""
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    },
                 textStyle = TextStyle(color = Color.Transparent, fontSize = 1.sp),
                 cursorBrush = SolidColor(Color.Transparent),
                 enabled = state.sshConnected,
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(
-                    imeAction = ImeAction.None,
-                    keyboardType = KeyboardType.Ascii,
+                    imeAction = ImeAction.Send,
+                    keyboardType = KeyboardType.Text,
                     capitalization = KeyboardCapitalization.None,
                     autoCorrect = false
                 ),
-                keyboardActions = KeyboardActions()
+                keyboardActions = KeyboardActions(
+                    onSend = {
+                        if (state.sshConnected) {
+                            onRawSend("\r")
+                            draft = ""
+                        }
+                    },
+                    onDone = {
+                        if (state.sshConnected) {
+                            onRawSend("\r")
+                            draft = ""
+                        }
+                    },
+                    onGo = {
+                        if (state.sshConnected) {
+                            onRawSend("\r")
+                            draft = ""
+                        }
+                    }
+                )
             )
         }
     }
