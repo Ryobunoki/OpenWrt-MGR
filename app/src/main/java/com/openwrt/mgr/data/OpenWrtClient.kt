@@ -388,45 +388,129 @@ class OpenWrtClient(
     }
 
     private fun fetchWirelessUbus(session: RouterSession): List<WirelessInterface> {
-        val result = runCatching {
-            ubusCall(session, "luci-rpc", "getWirelessDevices", JSONObject())
-        }.getOrNull() ?: return emptyList()
-        val data = result.optJSONObject(1) ?: return emptyList()
+        // Multiple backends: luci-rpc is not always installed; network.wireless / iwinfo are more common.
+        val fromLuci = runCatching { parseWirelessDevicesTree(ubusCall(session, "luci-rpc", "getWirelessDevices", JSONObject()).optJSONObject(1)) }
+            .getOrDefault(emptyList())
+        if (fromLuci.isNotEmpty()) return fromLuci
+
+        val fromNet = runCatching { parseWirelessDevicesTree(ubusCall(session, "network.wireless", "status", JSONObject()).optJSONObject(1)) }
+            .getOrDefault(emptyList())
+        if (fromNet.isNotEmpty()) return fromNet
+
+        // Some firmwares nest under result[1] differently or return the tree at index 1 as empty with data elsewhere.
+        val fromNetRaw = runCatching {
+            val arr = ubusCall(session, "network.wireless", "status", JSONObject())
+            parseWirelessDevicesTree(extractJsonObject(arr, 1))
+        }.getOrDefault(emptyList())
+        if (fromNetRaw.isNotEmpty()) return fromNetRaw
+
+        val fromIwinfo = runCatching { fetchWirelessIwinfo(session) }.getOrDefault(emptyList())
+        if (fromIwinfo.isNotEmpty()) return fromIwinfo
+
+        val fromUciRpc = runCatching { fetchWirelessUciRpc(session) }.getOrDefault(emptyList())
+        if (fromUciRpc.isNotEmpty()) return fromUciRpc
+
+        val fromUci = runCatching { fetchWirelessUci(session) }.getOrDefault(emptyList())
+        return fromUci
+    }
+
+    /** Accept JSONObject or JSONArray-at-index payloads from ubus result. */
+    private fun extractJsonObject(result: JSONArray, index: Int): JSONObject? {
+        result.optJSONObject(index)?.let { return it }
+        // Rare: whole payload is a single object encoded as string
+        val any = result.opt(index) ?: return null
+        return when (any) {
+            is JSONObject -> any
+            is String -> runCatching { JSONObject(any) }.getOrNull()
+            else -> null
+        }
+    }
+
+    /**
+     * Parse luci-rpc getWirelessDevices / network.wireless status trees.
+     * `interfaces` may be a JSONObject (keyed) or a JSONArray.
+     */
+    private fun parseWirelessDevicesTree(data: JSONObject?): List<WirelessInterface> {
+        if (data == null || data.length() == 0) return emptyList()
         val list = mutableListOf<WirelessInterface>()
         val radios = data.keys()
         while (radios.hasNext()) {
             val radio = radios.next()
+            // Skip non-radio metadata keys if any
+            if (radio.startsWith("_")) continue
             val radioObj = data.optJSONObject(radio) ?: continue
             val radioConfig = radioObj.optJSONObject("config") ?: JSONObject()
-            val radioIwinfo = radioObj.optJSONObject("iwinfo") ?: JSONObject()
-            val radioUp = radioObj.optBoolean("up", true)
-            val interfaces = radioObj.optJSONObject("interfaces") ?: continue
-            val ifKeys = interfaces.keys()
-            while (ifKeys.hasNext()) {
-                val key = ifKeys.next()
-                val iface = interfaces.optJSONObject(key) ?: continue
+            val radioIwinfo = radioObj.optJSONObject("iwinfo")
+                ?: radioObj.optJSONObject("device")
+                ?: JSONObject()
+            val radioUp = when {
+                radioObj.has("up") -> radioObj.optBoolean("up", true)
+                radioObj.has("disabled") -> !radioObj.optBoolean("disabled", false)
+                else -> true
+            }
+
+            val ifaceList = mutableListOf<Pair<String, JSONObject>>()
+            val ifacesObj = radioObj.optJSONObject("interfaces")
+            val ifacesArr = radioObj.optJSONArray("interfaces")
+            when {
+                ifacesObj != null -> {
+                    val keys = ifacesObj.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        val o = ifacesObj.optJSONObject(k) ?: continue
+                        ifaceList += k to o
+                    }
+                }
+                ifacesArr != null -> {
+                    for (i in 0 until ifacesArr.length()) {
+                        val o = ifacesArr.optJSONObject(i) ?: continue
+                        val k = o.optString("section", o.optString("ifname", i.toString()))
+                        ifaceList += k to o
+                    }
+                }
+            }
+
+            if (ifaceList.isEmpty()) {
+                // Radio exists but no interface sections yet — still surface radio config.
+                val ch = radioConfig.opt("channel")?.toString()
+                    ?: radioIwinfo.opt("channel")?.toString()
+                    ?: "-"
+                list += WirelessInterface(
+                    radio = radio,
+                    ifname = radio,
+                    ssid = "-",
+                    mode = "-",
+                    channel = ch,
+                    frequency = formatFrequency(radioIwinfo.opt("frequency")),
+                    signal = "---",
+                    noise = "---",
+                    bitrate = "? Mbit/s",
+                    bssid = "-",
+                    encryption = "-",
+                    hardware = formatHardware(radioIwinfo, radioConfig),
+                    up = radioUp
+                )
+                continue
+            }
+
+            for ((key, iface) in ifaceList) {
                 val config = iface.optJSONObject("config") ?: JSONObject()
                 val iwinfo = iface.optJSONObject("iwinfo") ?: JSONObject()
-                val hwName = iwinfo.optJSONObject("hardware")?.optString("name")
-                    ?.takeIf { it.isNotBlank() }
-                    ?: radioIwinfo.optJSONObject("hardware")?.optString("name")
-                    ?.takeIf { it.isNotBlank() }
-                    ?: "-"
-                val hwmodes = formatHwModes(
-                    iwinfo.optJSONArray("hwmodes")
-                        ?: radioIwinfo.optJSONArray("hwmodes")
-                        ?: iwinfo.optJSONArray("hwmodeslist")
+                // Merge radio-level iwinfo for hardware/channel when iface lacks it
+                val hw = formatHardware(
+                    if (iwinfo.length() > 0) iwinfo else radioIwinfo,
+                    radioConfig
                 )
-                val hardware = when {
-                    hwName != "-" && hwmodes.isNotBlank() -> "$hwName $hwmodes"
-                    hwName != "-" -> hwName
-                    else -> hwmodes.ifBlank { "-" }
-                }
                 val channel = iwinfo.opt("channel")?.toString()
                     ?: config.opt("channel")?.toString()
                     ?: radioConfig.opt("channel")?.toString()
+                    ?: radioIwinfo.opt("channel")?.toString()
                     ?: "-"
-                val frequency = formatFrequency(iwinfo.opt("frequency") ?: radioIwinfo.opt("frequency"))
+                val frequency = formatFrequency(
+                    iwinfo.opt("frequency")
+                        ?: radioIwinfo.opt("frequency")
+                        ?: channelToFrequencyGuess(channel, radioConfig)
+                )
                 val signalRaw = iwinfo.opt("signal")
                 val noiseRaw = iwinfo.opt("noise")
                 val signal = when {
@@ -443,15 +527,20 @@ class OpenWrtClient(
                     modeIw.isNotBlank() -> modeIw
                     modeCfg.equals("ap", true) -> "Master"
                     modeCfg.equals("sta", true) -> "Client"
+                    modeCfg.equals("monitor", true) -> "Monitor"
                     modeCfg.isNotBlank() -> modeCfg
                     else -> "-"
                 }
+                val ifname = sequenceOf(
+                    iwinfo.optString("ifname", ""),
+                    iface.optString("ifname", ""),
+                    config.optString("ifname", ""),
+                    key
+                ).firstOrNull { it.isNotBlank() } ?: radio
+
                 list += WirelessInterface(
                     radio = radio,
-                    ifname = iwinfo.optString(
-                        "ifname",
-                        iface.optString("ifname", config.optString("ifname", key))
-                    ),
+                    ifname = ifname,
                     ssid = config.optString("ssid", iwinfo.optString("ssid", "-")).ifBlank { "-" },
                     mode = mode,
                     channel = channel,
@@ -464,12 +553,295 @@ class OpenWrtClient(
                         iwinfo.optJSONObject("encryption"),
                         config.optString("encryption", "")
                     ),
-                    hardware = hardware,
-                    up = radioUp && !config.optBoolean("disabled", false)
+                    hardware = hw,
+                    up = radioUp &&
+                        !config.optBoolean("disabled", false) &&
+                        !iface.optBoolean("disabled", false)
                 )
             }
         }
         return list.sortedWith(compareBy({ it.radio }, { it.ifname }, { it.ssid }))
+    }
+
+    private fun fetchWirelessIwinfo(session: RouterSession): List<WirelessInterface> {
+        val devResult = ubusCall(session, "iwinfo", "devices", JSONObject())
+        val devObj = extractJsonObject(devResult, 1) ?: return emptyList()
+        val names = mutableListOf<String>()
+        val arr = devObj.optJSONArray("devices")
+            ?: devObj.optJSONArray("device")
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val n = arr.optString(i)
+                if (n.isNotBlank()) names += n
+            }
+        } else {
+            // Some builds return a bare array at result[1]
+            val bare = devResult.optJSONArray(1)
+            if (bare != null) {
+                for (i in 0 until bare.length()) {
+                    val n = bare.optString(i)
+                    if (n.isNotBlank()) names += n
+                }
+            } else {
+                // Or object map of device names
+                val keys = devObj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    if (k != "devices") names += k
+                }
+            }
+        }
+        if (names.isEmpty()) return emptyList()
+
+        val list = mutableListOf<WirelessInterface>()
+        for (dev in names.distinct()) {
+            val infoResult = runCatching {
+                ubusCall(session, "iwinfo", "info", JSONObject().put("device", dev))
+            }.getOrNull() ?: continue
+            val info = extractJsonObject(infoResult, 1) ?: continue
+            val ssid = info.optString("ssid", "-").ifBlank { "-" }
+            val mode = info.optString("mode", "-").ifBlank { "-" }
+            val channel = info.opt("channel")?.toString() ?: "-"
+            list += WirelessInterface(
+                radio = info.optString("phyname", dev),
+                ifname = dev,
+                ssid = ssid,
+                mode = mode,
+                channel = channel,
+                frequency = formatFrequency(info.opt("frequency")),
+                signal = info.opt("signal")?.toString() ?: "---",
+                noise = info.opt("noise")?.toString() ?: "---",
+                bitrate = formatBitrate(info.opt("bitrate")),
+                bssid = info.optString("bssid", "-").ifBlank { "-" },
+                encryption = formatEncryption(info.optJSONObject("encryption"), ""),
+                hardware = formatHardware(info, JSONObject()),
+                up = true
+            )
+        }
+        return list.sortedWith(compareBy({ it.radio }, { it.ifname }, { it.ssid }))
+    }
+
+    private fun fetchWirelessUciRpc(session: RouterSession): List<WirelessInterface> {
+        // rpcd uci get — works when luci-rpc / iwinfo are restricted
+        val result = ubusCall(
+            session,
+            "uci",
+            "get",
+            JSONObject().put("config", "wireless")
+        )
+        val data = extractJsonObject(result, 1) ?: return emptyList()
+        val values = data.optJSONObject("values") ?: data
+        if (values.length() == 0) return emptyList()
+
+        data class Sec(var type: String = "", val opts: MutableMap<String, String> = mutableMapOf())
+        val secs = linkedMapOf<String, Sec>()
+        val keys = values.keys()
+        while (keys.hasNext()) {
+            val name = keys.next()
+            val obj = values.optJSONObject(name) ?: continue
+            val sec = Sec(type = obj.optString(".type", obj.optString("type", "")))
+            val ok = obj.keys()
+            while (ok.hasNext()) {
+                val k = ok.next()
+                if (k.startsWith(".")) continue
+                val v = obj.opt(k) ?: continue
+                sec.opts[k] = when (v) {
+                    is JSONArray -> (0 until v.length()).joinToString(" ") { v.optString(it) }
+                    else -> v.toString()
+                }
+            }
+            secs[name] = sec
+        }
+
+        val devices = secs.filter { it.value.type == "wifi-device" }
+        val ifaces = secs.filter { it.value.type == "wifi-iface" }
+        if (devices.isEmpty() && ifaces.isEmpty()) return emptyList()
+
+        val list = mutableListOf<WirelessInterface>()
+        val source = if (ifaces.isNotEmpty()) ifaces else devices
+        for ((name, sec) in source) {
+            if (sec.type == "wifi-device" && ifaces.isNotEmpty()) continue
+            val radio = if (sec.type == "wifi-iface") {
+                sec.opts["device"] ?: devices.keys.firstOrNull() ?: name
+            } else name
+            val devSec = devices[radio]
+            val channel = if (sec.type == "wifi-device") {
+                sec.opts["channel"] ?: "-"
+            } else {
+                devSec?.opts?.get("channel") ?: "-"
+            }
+            val band = devSec?.opts?.get("band") ?: sec.opts["band"] ?: ""
+            val ssid = sec.opts["ssid"] ?: if (sec.type == "wifi-device") "-" else "-"
+            val modeCfg = sec.opts["mode"] ?: ""
+            list += WirelessInterface(
+                radio = radio,
+                ifname = name,
+                ssid = ssid.ifBlank { "-" },
+                mode = when (modeCfg.lowercase()) {
+                    "ap" -> "Master"
+                    "sta" -> "Client"
+                    "" -> if (sec.type == "wifi-device") "-" else "-"
+                    else -> modeCfg
+                },
+                channel = channel,
+                frequency = channelToFrequencyGuess(channel, JSONObject().put("band", band)),
+                signal = "---",
+                noise = "---",
+                bitrate = "? Mbit/s",
+                bssid = "-",
+                encryption = formatEncryption(null, sec.opts["encryption"] ?: ""),
+                hardware = devSec?.opts?.get("path") ?: sec.opts["path"] ?: "-",
+                up = sec.opts["disabled"] != "1" && devSec?.opts?.get("disabled") != "1"
+            )
+        }
+        return list.sortedWith(compareBy({ it.radio }, { it.ifname }, { it.ssid }))
+    }
+
+    private fun fetchWirelessUci(session: RouterSession): List<WirelessInterface> {
+        // Last resort: dump uci wireless via luci / file.exec style used elsewhere.
+        val text = runCatching {
+            val r = ubusCall(
+                session,
+                "file",
+                "exec",
+                JSONObject()
+                    .put("command", "/sbin/uci")
+                    .put("params", JSONArray().put("-q").put("show").put("wireless"))
+            )
+            // file.exec result: [0, { code, stdout, stderr }]
+            val payload = extractJsonObject(r, 1)
+            payload?.optString("stdout")
+                ?: payload?.optString("stderr")
+                ?: ""
+        }.getOrDefault("")
+        if (text.isBlank()) return emptyList()
+
+        // Parse "wireless.radio0=wifi-device" / "wireless.default_radio0.ssid='x'"
+        data class Sec(var type: String = "", val opts: MutableMap<String, String> = mutableMapOf())
+        val secs = linkedMapOf<String, Sec>()
+        val lineRe = Regex("""^wireless\.([^=.\s]+)(?:\.([^=\s]+))?=(.*)$""")
+        for (raw in text.lineSequence()) {
+            val line = raw.trim()
+            if (line.isEmpty()) continue
+            val m = lineRe.matchEntire(line) ?: continue
+            val sec = m.groupValues[1]
+            val opt = m.groupValues[2]
+            var value = m.groupValues[3].trim()
+            if (value.startsWith("'") && value.endsWith("'") && value.length >= 2) {
+                value = value.substring(1, value.length - 1)
+            }
+            if (value.startsWith("\"") && value.endsWith("\"") && value.length >= 2) {
+                value = value.substring(1, value.length - 1)
+            }
+            val s = secs.getOrPut(sec) { Sec() }
+            if (opt.isEmpty()) {
+                s.type = value
+            } else {
+                s.opts[opt] = value
+            }
+        }
+
+        val devices = secs.filter { it.value.type == "wifi-device" || it.key.startsWith("radio") }
+        val ifaces = secs.filter { it.value.type == "wifi-iface" || it.value.opts.containsKey("ssid") || it.value.opts.containsKey("device") }
+        if (devices.isEmpty() && ifaces.isEmpty()) return emptyList()
+
+        val list = mutableListOf<WirelessInterface>()
+        if (ifaces.isNotEmpty()) {
+            for ((name, sec) in ifaces) {
+                val radio = sec.opts["device"] ?: devices.keys.firstOrNull() ?: name
+                val devSec = devices[radio]
+                val channel = devSec?.opts?.get("channel") ?: "-"
+                val band = devSec?.opts?.get("band") ?: ""
+                list += WirelessInterface(
+                    radio = radio,
+                    ifname = name,
+                    ssid = sec.opts["ssid"] ?: "-",
+                    mode = when (sec.opts["mode"]?.lowercase()) {
+                        "ap" -> "Master"
+                        "sta" -> "Client"
+                        else -> sec.opts["mode"] ?: "-"
+                    },
+                    channel = channel,
+                    frequency = channelToFrequencyGuess(channel, JSONObject().put("band", band)),
+                    signal = "---",
+                    noise = "---",
+                    bitrate = "? Mbit/s",
+                    bssid = "-",
+                    encryption = formatEncryption(null, sec.opts["encryption"] ?: ""),
+                    hardware = devSec?.opts?.get("path") ?: "-",
+                    up = sec.opts["disabled"] != "1" && devSec?.opts?.get("disabled") != "1"
+                )
+            }
+        } else {
+            for ((radio, devSec) in devices) {
+                list += WirelessInterface(
+                    radio = radio,
+                    ifname = radio,
+                    ssid = "-",
+                    mode = "-",
+                    channel = devSec.opts["channel"] ?: "-",
+                    frequency = channelToFrequencyGuess(
+                        devSec.opts["channel"] ?: "-",
+                        JSONObject().put("band", devSec.opts["band"] ?: "")
+                    ),
+                    signal = "---",
+                    noise = "---",
+                    bitrate = "? Mbit/s",
+                    bssid = "-",
+                    encryption = "-",
+                    hardware = devSec.opts["path"] ?: "-",
+                    up = devSec.opts["disabled"] != "1"
+                )
+            }
+        }
+        return list.sortedWith(compareBy({ it.radio }, { it.ifname }, { it.ssid }))
+    }
+
+    private fun formatHardware(iwinfo: JSONObject, radioConfig: JSONObject): String {
+        val hwName = iwinfo.optJSONObject("hardware")?.optString("name")
+            ?.takeIf { it.isNotBlank() }
+            ?: iwinfo.optString("hardware_name", "").takeIf { it.isNotBlank() }
+            ?: radioConfig.optString("path", "").takeIf { it.isNotBlank() }
+            ?: "-"
+        val hwmodes = formatHwModes(
+            iwinfo.optJSONArray("hwmodes")
+                ?: iwinfo.optJSONArray("hwmodeslist")
+                ?: iwinfo.optJSONArray("hwmode")
+        )
+        val ht = radioConfig.optString("htmode", iwinfo.optString("htmode", ""))
+        return when {
+            hwName != "-" && hwmodes.isNotBlank() -> "$hwName $hwmodes"
+            hwName != "-" && ht.isNotBlank() -> "$hwName ($ht)"
+            hwName != "-" -> hwName
+            hwmodes.isNotBlank() -> hwmodes
+            else -> "-"
+        }
+    }
+
+    private fun channelToFrequencyGuess(channel: String, radioConfig: JSONObject): String {
+        val ch = channel.toIntOrNull() ?: return "-"
+        if (ch <= 0) return "-"
+        val band = radioConfig.optString("band", radioConfig.optString("hwmode", "")).lowercase()
+        val mhz = when {
+            band.contains("5") || band.contains("a") || ch > 14 -> {
+                // Common 5 GHz channel centers
+                when (ch) {
+                    in 36..64 -> 5000 + ch * 5
+                    in 100..144 -> 5000 + ch * 5
+                    in 149..165 -> 5000 + ch * 5
+                    else -> 5000 + ch * 5
+                }
+            }
+            else -> {
+                // 2.4 GHz
+                when (ch) {
+                    14 -> 2484
+                    in 1..13 -> 2407 + ch * 5
+                    else -> 2407 + ch * 5
+                }
+            }
+        }
+        return formatFrequency(mhz)
     }
 
     private fun formatFrequency(raw: Any?): String {
@@ -497,7 +869,7 @@ class OpenWrtClient(
         else String.format("%.1f Mbit/s", mbit)
     }
 
-    private fun formatHwModes(arr: org.json.JSONArray?): String {
+    private fun formatHwModes(arr: JSONArray?): String {
         if (arr == null || arr.length() == 0) return ""
         val modes = mutableListOf<String>()
         for (i in 0 until arr.length()) {
@@ -505,7 +877,6 @@ class OpenWrtClient(
             if (m.isNotBlank()) modes += m
         }
         if (modes.isEmpty()) return ""
-        // Prefer 802.11ax/ac style label
         return "802.11" + modes.distinct().joinToString("/")
     }
 
@@ -569,7 +940,7 @@ class OpenWrtClient(
         }
     }
 
-    fun listPlugins(session: RouterSession): List<PluginInfo> {
+fun listPlugins(session: RouterSession): List<PluginInfo> {
         // name/description/category store i18n keys (or brand names)
         val known = listOf(
             Triple("luci-app-lucky", "Lucky", "plugin_desc_lucky"),
