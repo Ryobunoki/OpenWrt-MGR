@@ -20,6 +20,7 @@ import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.key.key
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.foundation.text.BasicTextField
 import android.graphics.BitmapFactory
@@ -1392,8 +1393,13 @@ private fun SshTab(
             pendingCols = 0
             pendingRows = 0
         } else {
-            // Bind IME action key before the first Enter press
-            delay(120)
+            // Bind IME action key before the first Enter press (retry once for flaky IME attach)
+            delay(80)
+            runCatching {
+                focusRequester.requestFocus()
+                keyboard?.show()
+            }
+            delay(180)
             runCatching {
                 focusRequester.requestFocus()
                 keyboard?.show()
@@ -1569,12 +1575,21 @@ private fun SshTab(
                 softWrap = softWrap
             )
             // Hidden input: only sends keystrokes; never paints draft over remote echo
+            val sendEnter: () -> Unit = {
+                if (state.sshConnected) {
+                    onRawSend("\r")
+                    draft = ""
+                    // Keep IME bound so the next Enter still works without reopening the keyboard
+                    focusRequester.requestFocus()
+                    keyboard?.show()
+                }
+            }
             BasicTextField(
                 value = draft,
                 onValueChange = { nv ->
                     if (!state.sshConnected) return@BasicTextField
                     if (nv == draft) return@BasicTextField
-                    // Enter
+                    // Soft keyboard Enter often arrives as CR/LF in the value
                     if (nv.contains('\n') || nv.contains('\r')) {
                         val cleaned = nv.replace("\r\n", "\n").replace('\r', '\n')
                         val before = cleaned.substringBefore('\n')
@@ -1582,15 +1597,14 @@ private fun SshTab(
                             val extra = before.substring(draft.length)
                             if (extra.isNotEmpty()) onRawSend(extra)
                         } else if (before.isNotEmpty() && before != draft) {
-                            // IME replaced whole line — send as-is once without DEL spam
+                            // IME replaced whole line - send as-is once without DEL spam
                             if (draft.isNotEmpty()) {
                                 // clear remote line buffer: Ctrl+U
                                 onRawSend("\u0015")
                             }
                             if (before.isNotEmpty()) onRawSend(before)
                         }
-                        onRawSend("\r")
-                        draft = ""
+                        sendEnter()
                         return@BasicTextField
                     }
                     when {
@@ -1613,18 +1627,16 @@ private fun SshTab(
                 },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(1.dp)
+                    // Keep a real hit-target so the first IME action is bound reliably
+                    .height(24.dp)
                     .align(Alignment.BottomStart)
                     .focusRequester(focusRequester)
-                    .alpha(0.02f)
+                    .alpha(0.01f)
                     .onPreviewKeyEvent { e ->
                         if (e.type == KeyEventType.KeyDown &&
                             (e.key == Key.Enter || e.key == Key.NumPadEnter)
                         ) {
-                            if (state.sshConnected) {
-                                onRawSend("\r")
-                                draft = ""
-                            }
+                            sendEnter()
                             true
                         } else {
                             false
@@ -1633,32 +1645,20 @@ private fun SshTab(
                 textStyle = TextStyle(color = Color.Transparent, fontSize = 1.sp),
                 cursorBrush = SolidColor(Color.Transparent),
                 enabled = state.sshConnected,
-                singleLine = true,
+                // false + maxLines=1: Enter can arrive as newline via onValueChange on many IMEs
+                singleLine = false,
+                maxLines = 1,
                 keyboardOptions = KeyboardOptions(
                     imeAction = ImeAction.Send,
-                    keyboardType = KeyboardType.Text,
+                    // Prefer ASCII IME to avoid "first Enter commits composition" on CJK keyboards
+                    keyboardType = KeyboardType.Ascii,
                     capitalization = KeyboardCapitalization.None,
                     autoCorrect = false
                 ),
                 keyboardActions = KeyboardActions(
-                    onSend = {
-                        if (state.sshConnected) {
-                            onRawSend("\r")
-                            draft = ""
-                        }
-                    },
-                    onDone = {
-                        if (state.sshConnected) {
-                            onRawSend("\r")
-                            draft = ""
-                        }
-                    },
-                    onGo = {
-                        if (state.sshConnected) {
-                            onRawSend("\r")
-                            draft = ""
-                        }
-                    }
+                    onSend = { sendEnter() },
+                    onDone = { sendEnter() },
+                    onGo = { sendEnter() }
                 )
             )
         }
