@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-    tags:
-      - 'v*'
 
 permissions:
   contents: write
@@ -67,16 +65,34 @@ jobs:
           path: OpenWrt-MGR-*.apk
           if-no-files-found: error
 
-      # Auto-create/update GitHub Release from versionName on every successful build
+      # Create or update GitHub Release for versionName (re-runs of same version OK)
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ env.VERSION }}
-          name: ${{ env.VERSION }}
-          files: OpenWrt-MGR-*.apk
-          draft: false
-          prerelease: false
-          make_latest: true
-          generate_release_notes: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          TITLE="OpenWrt-MGR ${VERSION}"
+          shopt -s nullglob
+          APKS=(OpenWrt-MGR-*.apk)
+          if [ ${#APKS[@]} -eq 0 ]; then
+            echo "APK not found"
+            exit 1
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release ${TAG} exists — replacing assets"
+            gh release upload "$TAG" "${APKS[@]}" --clobber
+            gh release edit "$TAG" --title "$TITLE" --latest
+          else
+            echo "Creating release ${TAG} at ${GITHUB_SHA}"
+            # --target pins the release to this commit without a separate tag push loop
+            gh release create "$TAG" "${APKS[@]}" \
+              --title "$TITLE" \
+              --target "${GITHUB_SHA}" \
+              --generate-notes \
+              --latest
+          fi
+
+          echo "Release URL:"
+          gh release view "$TAG" --json url -q .url
